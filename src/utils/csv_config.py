@@ -77,4 +77,15 @@ def read_csv_by_name(path: str, name: str, **kwargs) -> pd.DataFrame:
     if auto_header:
         # assign placeholder column names
         df.columns = [f"ft_{i+1}" for i in range(len(df.columns))]
+
+    # dataset-specific post-processing hooks
+    if name.lower() == "german":
+        # the last feature represents the target; convert to binary 0/1
+        # where original 1->0 and 2->1 and rename column to 'target'
+        if not df.empty:
+            last_col = df.columns[-1]
+            df["target"] = df[last_col].map({1: 0, 2: 1})
+            # drop the original raw column if it isn't already named 'target'
+            if last_col != "target":
+                df = df.drop(columns=[last_col])
     return df
