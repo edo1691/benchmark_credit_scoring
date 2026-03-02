@@ -1,10 +1,10 @@
 import os
-
+import numpy as np
 import pandas as pd
 import joblib
 
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder, FunctionTransformer
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 
@@ -20,10 +20,10 @@ from sklearn.neural_network import MLPClassifier
 
 from sklearn.model_selection import train_test_split, StratifiedKFold
 
-# Optional dependencies
+# Optional model deps
 try:
     from lightgbm import LGBMClassifier
-except Exception as e:  # could be OSError due to missing libomp or ImportError
+except Exception as e:
     LGBMClassifier = None
     _lightgbm_import_error = e
 
@@ -33,14 +33,19 @@ except Exception as e:
     XGBClassifier = None
     _xgboost_import_error = e
 
+# Optional skopt deps
 try:
     from skopt import BayesSearchCV
-    from skopt.space import Space  # <- version-agnostic validation helper
+    from skopt.space import Space, Integer, Real, Categorical
 except ImportError as e:
     BayesSearchCV = None
     Space = None
+    Integer = None
+    Real = None
+    Categorical = None
     _skopt_import_error = e
 
+# Project deps
 try:
     from src.model.search_spaces import search_spaces
     from src.model.search_spaces_test import search_spaces as search_spaces_test
@@ -51,94 +56,135 @@ except ImportError as e:
     NumericTransformer = None
     _churn_import_error = e
 
-# GCP optional
+# Optional GCP deps
 try:
-    print(
-        "Attempting to import gcsfs for GCP support. If you don't have gcsfs installed, "
-    )
+    import gcsfs  # type: ignore
 except ImportError as e:
     gcsfs = None
     _gcsfs_import_error = e
 
 
-def get_model(algorithm="RandomForest", random_state=None, **kwargs):
-    """
-    Select the machine learning algorithm based on the provided name.
-    """
-    if algorithm == "RandomForest":
-        model = RandomForestClassifier(random_state=random_state, **kwargs)
+# -------------------------------
+# Picklable helper (module-level)
+# -------------------------------
+def to_dense_float(X):
+    """Convert sparse->dense (if needed) and cast to float64 for MLP stability."""
+    if hasattr(X, "toarray"):  # scipy sparse
+        X = X.toarray()
+    return np.asarray(X, dtype=np.float64)
 
-    elif algorithm == "LightGBM":
+
+def normalize_search_space(space: dict) -> dict:
+    """
+    Convert tuple/list shorthand into explicit skopt dimensions.
+    This avoids skopt 'Not all points are within the bounds of the space.' issues.
+
+    - (low, high) -> Integer if both int else Real
+    - [a,b,c] / (a,b,c) -> Categorical
+    - already Integer/Real/Categorical -> keep
+    """
+    if Integer is None or Real is None or Categorical is None:
+        raise ImportError(
+            "skopt.space Integer/Real/Categorical not available. "
+            "Install scikit-optimize (pip install scikit-optimize). "
+            f"Original error: {_skopt_import_error}"
+        )
+
+    out = {}
+    for k, v in space.items():
+        if isinstance(v, (Integer, Real, Categorical)):
+            out[k] = v
+            continue
+
+        if isinstance(v, tuple) and len(v) == 2:
+            low, high = v
+            if isinstance(low, (int, np.integer)) and isinstance(high, (int, np.integer)):
+                out[k] = Integer(int(low), int(high))
+            else:
+                out[k] = Real(float(low), float(high))
+            continue
+
+        if isinstance(v, (list, tuple)):
+            out[k] = Categorical(list(v))
+            continue
+
+        raise ValueError(f"Unsupported search-space spec for {k}: {v!r}")
+
+    return out
+
+
+def _validate_search_space(search_space: dict):
+    """Early validation: raises if skopt can't build a Space from your dimensions."""
+    if Space is None:
+        raise ImportError(
+            "skopt.space.Space is not available. "
+            "Install scikit-optimize (pip install scikit-optimize). "
+            f"Original error: {_skopt_import_error}"
+        )
+    if not isinstance(search_space, dict) or len(search_space) == 0:
+        raise ValueError(f"search_space must be a non-empty dict. Got: {search_space!r}")
+
+    # raises on invalid dims
+    Space(list(search_space.values()))
+
+
+def get_model(algorithm="RandomForest", random_state=None, **kwargs):
+    if algorithm == "RandomForest":
+        return RandomForestClassifier(random_state=random_state, **kwargs)
+
+    if algorithm == "LightGBM":
         if LGBMClassifier is None:
             raise ImportError(
                 "LightGBM is not available. "
                 "Have you installed libomp (e.g. `brew install libomp`)? "
                 f"Original error: {_lightgbm_import_error}"
             )
-        model = LGBMClassifier(
-            random_state=random_state, eval_metric="binary_logloss", **kwargs
-        )
+        return LGBMClassifier(random_state=random_state, eval_metric="binary_logloss", **kwargs)
 
-    elif algorithm == "XGBoost":
+    if algorithm == "XGBoost":
         if XGBClassifier is None:
-            raise ImportError(
-                "XGBoost is not available. " f"Original error: {_xgboost_import_error}"
-            )
-        model = XGBClassifier(
+            raise ImportError("XGBoost is not available. " f"Original error: {_xgboost_import_error}")
+        return XGBClassifier(
             random_state=random_state,
             use_label_encoder=False,
             eval_metric="aucpr",
             **kwargs,
         )
 
-    elif algorithm == "BoostDT":
-        model = GradientBoostingClassifier(
-            random_state=random_state, subsample=1, **kwargs
-        )
+    if algorithm == "BoostDT":
+        return GradientBoostingClassifier(random_state=random_state, subsample=1, **kwargs)
 
-    elif algorithm == "BoostSGB":
-        model = GradientBoostingClassifier(random_state=random_state, **kwargs)
+    if algorithm == "BoostSGB":
+        return GradientBoostingClassifier(random_state=random_state, **kwargs)
 
-    elif algorithm == "BagDT":
-        model = BaggingClassifier(
-            estimator=DecisionTreeClassifier(),
-            random_state=random_state,
-            **kwargs,
-        )
+    if algorithm == "BagDT":
+        return BaggingClassifier(estimator=DecisionTreeClassifier(), random_state=random_state, **kwargs)
 
-    elif algorithm == "BagNN":
-        model = BaggingClassifier(
+    if algorithm == "BagNN":
+        return BaggingClassifier(
             estimator=MLPClassifier(random_state=random_state),
             random_state=random_state,
             **kwargs,
         )
 
-    elif algorithm == "AdaBoost-NN":
-        # NOTE: AdaBoost passes sample_weight to the base estimator.
-        # Depending on sklearn version, MLPClassifier may NOT support sample_weight.
-        model = AdaBoostClassifier(
+    if algorithm == "AdaBoost-NN":
+        # NOTE: AdaBoost passes sample_weight. Depending on sklearn version, MLP may not support it.
+        return AdaBoostClassifier(
             estimator=MLPClassifier(random_state=random_state),
             random_state=random_state,
             **kwargs,
         )
 
-    elif algorithm == "AdaBoost-DT":
-        model = AdaBoostClassifier(
-            estimator=DecisionTreeClassifier(),
-            random_state=random_state,
-            **kwargs,
-        )
+    if algorithm == "AdaBoost-DT":
+        return AdaBoostClassifier(estimator=DecisionTreeClassifier(), random_state=random_state, **kwargs)
 
-    elif algorithm == "SVM-Rbf":
-        model = SVC(random_state=random_state, probability=True, **kwargs)
+    if algorithm == "SVM-Rbf":
+        return SVC(random_state=random_state, probability=True, **kwargs)
 
-    elif algorithm == "ANN":
-        model = MLPClassifier(random_state=random_state, **kwargs)
+    if algorithm == "ANN":
+        return MLPClassifier(random_state=random_state, **kwargs)
 
-    else:
-        raise ValueError("Unsupported algorithm.")
-
-    return model
+    raise ValueError(f"Unsupported algorithm: {algorithm}")
 
 
 def create_pipeline(
@@ -147,9 +193,6 @@ def create_pipeline(
     categorical_features=None,
     random_state=123,
 ):
-    """
-    Creates a sklearn pipeline that preprocesses data and trains a model.
-    """
     if NumericTransformer is None:
         raise ImportError(
             "NumericTransformer is not available (src.model.encoders import failed). "
@@ -161,10 +204,7 @@ def create_pipeline(
     categorical_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "ordinal",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-            ),
+            ("ordinal", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
         ]
     )
 
@@ -190,14 +230,24 @@ def create_pipeline(
         ]
     )
 
-    pipeline = Pipeline(
+    # MLP-family: enforce dense float for stability
+    needs_dense = algorithm in {"ANN", "BagNN", "AdaBoost-NN"}
+
+    if needs_dense:
+        return Pipeline(
+            [
+                ("preprocessing", preprocessor),
+                ("to_dense_float", FunctionTransformer(to_dense_float, validate=False)),
+                ("model", model),
+            ]
+        )
+
+    return Pipeline(
         [
             ("preprocessing", preprocessor),
             ("model", model),
         ]
     )
-
-    return pipeline
 
 
 def get_split_data(
@@ -211,14 +261,8 @@ def get_split_data(
     test_size=0.3,
     random_state=123,
 ):
-    """
-    Prepare X/y and split train/test.
-    IMPORTANT: y is returned as a 1D Series (required for robust sklearn scoring).
-    """
     if not isinstance(target_cols, (list, tuple)) or len(target_cols) != 1:
-        raise ValueError(
-            f"target_cols must be a list with exactly 1 column. Got: {target_cols}"
-        )
+        raise ValueError(f"target_cols must be a list with exactly 1 column. Got: {target_cols}")
 
     exclude_cols = list(exclude_cols) + list(ids_cols) + list(target_cols)
 
@@ -227,9 +271,7 @@ def get_split_data(
     categorical = [col for col in categorical_cols if col not in exclude_cols]
 
     x = data[features].copy()
-
-    # y MUST be 1D for clean sklearn behavior
-    y = data[target_cols[0]].astype(int).copy()
+    y = data[target_cols[0]].astype(int).copy()  # y must be 1D
 
     x_train, x_test, y_train, y_test = train_test_split(
         x, y, test_size=test_size, stratify=y, random_state=random_state
@@ -238,25 +280,26 @@ def get_split_data(
     return x_train, x_test, y_train, y_test, numerical, categorical
 
 
-def _validate_search_space(search_space: dict):
-    """
-    Validate skopt dimensions early so you don't get
-    'Not all points are within the bounds of the space.' mid-optimization.
-
-    Uses skopt.space.Space, which exists across skopt versions.
-    """
-    if Space is None:
+def get_search_space(algorithm, product, test_mode):
+    if search_spaces is None or search_spaces_test is None:
         raise ImportError(
-            "skopt.space.Space is not available. "
-            "Install scikit-optimize (pip install scikit-optimize). "
-            f"Original error: {_skopt_import_error}"
+            "Search spaces could not be imported. "
+            "Make sure src.model.search_spaces and src.model.search_spaces_test exist. "
+            f"Original error: {_churn_import_error}"
         )
 
-    if not isinstance(search_space, dict) or len(search_space) == 0:
-        raise ValueError(f"search_space must be a non-empty dict. Got: {search_space!r}")
+    spaces = search_spaces_test if test_mode else search_spaces
 
-    # Version-agnostic validation: will raise on invalid dimensions
-    Space(list(search_space.values()))
+    if algorithm not in spaces:
+        raise ValueError(f"No search space for algorithm: {algorithm}{' on test mode' if test_mode else ''}")
+
+    alg_params = spaces[algorithm]
+    if product in alg_params:
+        return alg_params[product]
+    if "default" in alg_params:
+        return alg_params["default"]
+
+    raise ValueError(f"No search space for product={product} algorithm={algorithm}")
 
 
 def get_train_model(
@@ -292,31 +335,28 @@ def get_train_model(
         random_state=random_state,
     )
 
-    search_space = get_search_space(algorithm, product, test_mode)
-    print(
-        f"Search space for algorithm={algorithm}, product={product}, test_mode={test_mode}: {search_space}"
-    )
+    # Get + normalize (critical)
+    search_space_raw = get_search_space(algorithm, product, test_mode)
+    search_space = normalize_search_space(search_space_raw)
 
-    # Validate space NOW (prevents skopt bound errors later)
+    print(f"Search space for algorithm={algorithm}, product={product}, test_mode={test_mode}: {search_space}")
+
     _validate_search_space(search_space)
 
-    if test_mode:
-        n_iter = 1
-        n_splits = 2
-    else:
-        n_iter = 50
-        n_splits = 5
+    n_iter = 1 if test_mode else 50
+    n_splits = 2 if test_mode else 5
 
-    cv_strategy = StratifiedKFold(
-        n_splits=n_splits, shuffle=True, random_state=random_state
-    )
+    cv_strategy = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     if BayesSearchCV is None:
         raise ImportError(
             "skopt.BayesSearchCV is not available. "
-            "Install scikit-optimize (e.g. `pip install scikit-optimize`)"
-            f". Original error: {_skopt_import_error}"
+            "Install scikit-optimize (pip install scikit-optimize). "
+            f"Original error: {_skopt_import_error}"
         )
+
+    # Important: n_points=1 avoids batch ask/tell path that often triggers the bounds bug
+    n_jobs = 1 if algorithm in {"ANN", "BagNN", "AdaBoost-NN"} else -1
 
     bayes_search = BayesSearchCV(
         estimator=pipeline,
@@ -326,8 +366,9 @@ def get_train_model(
         cv=cv_strategy,
         random_state=random_state,
         verbose=0,
-        n_jobs=-1,
-        error_score="raise",  # debug mode; switch to -np.inf after everything is stable
+        n_jobs=n_jobs,
+        n_points=1,          # <-- critical for older skopt stability
+        error_score="raise",
     )
 
     bayes_search.fit(x_train, y_train)
@@ -339,39 +380,7 @@ def get_train_model(
     return best_pipeline, best_params, best_score
 
 
-def get_search_space(algorithm, product, test):
-    """
-    Pull search space from search_spaces_test when test=True, else search_spaces.
-    """
-    if search_spaces is None or search_spaces_test is None:
-        raise ImportError(
-            "Search spaces could not be imported. "
-            "Make sure src.model.search_spaces and src.model.search_spaces_test exist. "
-            f"Original error: {_churn_import_error}"
-        )
-
-    search_spaces_all = {True: search_spaces_test, False: search_spaces}
-
-    if algorithm not in search_spaces_all[test]:
-        raise ValueError(
-            f"No search space for algorithm: {algorithm}{' on test mode' if test else ''}"
-        )
-
-    alg_params = search_spaces_all[test][algorithm]
-    if product in alg_params:
-        return alg_params[product]
-    if "default" in alg_params:
-        return alg_params["default"]
-
-    raise ValueError(
-        f"No search space for {product} and algorithm {algorithm}{' on test mode' if test else ''}"
-    )
-
-
 def save_model(path: str, model, environment: str = "local"):
-    """
-    Save a model to a specified path, supporting both local and GCP environments.
-    """
     try:
         if environment == "gcp":
             if gcsfs is None:
@@ -399,9 +408,6 @@ def save_model(path: str, model, environment: str = "local"):
 
 
 def load_model(path: str, environment: str = "local"):
-    """
-    Load a model from a specified path, supporting both local and GCP environments.
-    """
     try:
         if environment == "gcp":
             fs = gcsfs.GCSFileSystem()
