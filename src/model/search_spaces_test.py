@@ -157,8 +157,11 @@ search_spaces = {
     "ANN": {
         "default": {
             "model__hidden_layer_sizes": Categorical([(50,), (100,), (100, 50)]),
-            "model__activation": Categorical(["relu"]),
-            "model__alpha": Real(1e-5, 1e-2, prior="log-uniform"),
+            "model__activation": Categorical(["relu", "tanh"]),
+            "model__alpha": Real(1e-4, 1e-2, prior="log-uniform"),
+            "model__solver": Categorical(["adam"]),   # keep stable
+            "model__learning_rate_init": Real(1e-4, 1e-2, prior="log-uniform"),
+            "model__max_iter": Integer(200, 800),
         }
     },
 }
