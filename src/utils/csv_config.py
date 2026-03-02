@@ -11,7 +11,12 @@ DEFAULT_CSV_CONFIG: Dict[str, Dict[str, Any]] = {
         "encoding": "utf-8",
         "auto_header": True,
     },
-    "australian": {"sep": ",", "header": 0, "encoding": "utf-8"},
+    "australian": {
+        "sep": r"\s+",
+        "engine": "python",
+        "header": None,
+        "auto_header": True,
+    },
     "japan": {"sep": ",", "header": 0, "encoding": "utf-8"},
     "kg_ccdea": {"sep": ",", "header": 0, "encoding": "utf-8"},
     "kg_gmsc": {"sep": ",", "header": 0, "encoding": "utf-8"},
@@ -76,10 +81,16 @@ def read_csv_by_name(path: str, name: str, **kwargs) -> pd.DataFrame:
         df.columns = [f"ft_{i+1}" for i in range(len(df.columns))]
 
     # ✅ dataset-specific post-processing only for RAW files
-    if (not is_derived) and base_name == "german":
+    if (not is_derived) and base_name in ["german"]:
         if not df.empty:
             last_col = df.columns[-1]
             df["target"] = df[last_col].map({1: 0, 2: 1})
+            if last_col != "target":
+                df = df.drop(columns=[last_col])
+    if (not is_derived) and base_name in ["australian"]:
+        if not df.empty:
+            last_col = df.columns[-1]
+            df["target"] = df[last_col].map({0: 0, 1: 1})
             if last_col != "target":
                 df = df.drop(columns=[last_col])
 
@@ -147,7 +158,10 @@ def create_imbalanced_datasets(
         n_pos_new = int(df_new[target_col].sum())
         new_rate = float(df_new[target_col].mean())
 
-        save_path = data_dir / "intermediate" / f"{dataset_name}" / f"{dataset_name}_{pct}.csv"
+        save_dir = data_dir / "intermediate" / f"{dataset_name}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        save_path = save_dir / f"{dataset_name}_{pct}.csv"
 
         # ✅ save as derived format that read_csv_by_name will parse with "_derived"
         df_new.to_csv(save_path, index=False, sep=",")
