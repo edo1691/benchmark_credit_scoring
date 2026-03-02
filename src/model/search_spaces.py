@@ -159,9 +159,8 @@ search_spaces = {
             "model__hidden_layer_sizes": Categorical([(50,), (100,), (100, 50)]),
             "model__activation": Categorical(["relu", "tanh"]),
             "model__solver": Categorical(["adam"]),
-            "model__alpha": Categorical([1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]),
-            "model__learning_rate_init": Categorical([1e-4, 3e-4, 1e-3, 3e-3, 1e-2]),
-            "model__max_iter": Integer(200, 800),
+            "model__alpha": Real(1e-6, 1e-2, prior="log-uniform"),
+            "model__learning_rate_init": Real(1e-5, 1e-2, prior="log-uniform"),
         }
     },
 }

@@ -7,6 +7,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder, FunctionTransformer
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.base import clone  # <-- FIX: sklearn clone (not joblib.clone)
 
 from sklearn.ensemble import (
     RandomForestClassifier,
@@ -19,8 +20,9 @@ from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
 
 from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import average_precision_score
 
-# Optional model deps
+# Optional deps
 try:
     from lightgbm import LGBMClassifier
 except Exception as e:
@@ -33,7 +35,6 @@ except Exception as e:
     XGBClassifier = None
     _xgboost_import_error = e
 
-# Optional skopt deps
 try:
     from skopt import BayesSearchCV
     from skopt.space import Space, Integer, Real, Categorical
@@ -45,7 +46,6 @@ except ImportError as e:
     Categorical = None
     _skopt_import_error = e
 
-# Project deps
 try:
     from src.model.search_spaces import search_spaces
     from src.model.search_spaces_test import search_spaces as search_spaces_test
@@ -56,7 +56,7 @@ except ImportError as e:
     NumericTransformer = None
     _churn_import_error = e
 
-# Optional GCP deps
+# Optional GCP dep
 try:
     import gcsfs  # type: ignore
 except ImportError as e:
@@ -77,11 +77,6 @@ def to_dense_float(X):
 def normalize_search_space(space: dict) -> dict:
     """
     Convert tuple/list shorthand into explicit skopt dimensions.
-    This avoids skopt 'Not all points are within the bounds of the space.' issues.
-
-    - (low, high) -> Integer if both int else Real
-    - [a,b,c] / (a,b,c) -> Categorical
-    - already Integer/Real/Categorical -> keep
     """
     if Integer is None or Real is None or Categorical is None:
         raise ImportError(
@@ -114,7 +109,6 @@ def normalize_search_space(space: dict) -> dict:
 
 
 def _validate_search_space(search_space: dict):
-    """Early validation: raises if skopt can't build a Space from your dimensions."""
     if Space is None:
         raise ImportError(
             "skopt.space.Space is not available. "
@@ -123,9 +117,28 @@ def _validate_search_space(search_space: dict):
         )
     if not isinstance(search_space, dict) or len(search_space) == 0:
         raise ValueError(f"search_space must be a non-empty dict. Got: {search_space!r}")
+    Space(list(search_space.values()))  # raises if invalid
 
-    # raises on invalid dims
-    Space(list(search_space.values()))
+
+def sample_one_params(search_space: dict, random_state: int = 123) -> dict:
+    """
+    Draw 1 random point from a skopt search_space dict and return as params dict.
+    """
+    if Space is None:
+        raise ImportError(
+            "skopt.space.Space is not available. "
+            "Install scikit-optimize (pip install scikit-optimize). "
+            f"Original error: {_skopt_import_error}"
+        )
+
+    rng = np.random.RandomState(random_state)
+
+    keys = list(search_space.keys())
+    dims = list(search_space.values())
+    space = Space(dims)
+
+    point = space.rvs(n_samples=1, random_state=rng)[0]
+    return dict(zip(keys, point))
 
 
 def get_model(algorithm="RandomForest", random_state=None, **kwargs):
@@ -168,7 +181,6 @@ def get_model(algorithm="RandomForest", random_state=None, **kwargs):
         )
 
     if algorithm == "AdaBoost-NN":
-        # NOTE: AdaBoost passes sample_weight. Depending on sklearn version, MLP may not support it.
         return AdaBoostClassifier(
             estimator=MLPClassifier(random_state=random_state),
             random_state=random_state,
@@ -230,7 +242,6 @@ def create_pipeline(
         ]
     )
 
-    # MLP-family: enforce dense float for stability
     needs_dense = algorithm in {"ANN", "BagNN", "AdaBoost-NN"}
 
     if needs_dense:
@@ -242,12 +253,7 @@ def create_pipeline(
             ]
         )
 
-    return Pipeline(
-        [
-            ("preprocessing", preprocessor),
-            ("model", model),
-        ]
-    )
+    return Pipeline([("preprocessing", preprocessor), ("model", model)])
 
 
 def get_split_data(
@@ -313,8 +319,15 @@ def get_train_model(
     product,
     algorithm="RandomForest",
     test_mode=False,
+    ann_random_search_iter: int = 25,  # used only for ANN (no BayesOpt)
     **kwargs,
 ):
+    """
+    Train model with hyperparameter search.
+
+    - For ANN: avoids Bayesian optimization. Uses random search over the same skopt space + CV.
+    - For others: BayesSearchCV as before.
+    """
     random_state = 123
 
     x_train, x_test, y_train, y_test, numerical, categorical = get_split_data(
@@ -335,17 +348,65 @@ def get_train_model(
         random_state=random_state,
     )
 
-    # Get + normalize (critical)
     search_space_raw = get_search_space(algorithm, product, test_mode)
     search_space = normalize_search_space(search_space_raw)
-
     print(f"Search space for algorithm={algorithm}, product={product}, test_mode={test_mode}: {search_space}")
 
+    # ---------------------------------------------------------------------
+    # ANN: avoid BayesSearchCV entirely -> random search on the defined space
+    # ---------------------------------------------------------------------
+    if algorithm == "ANN":
+        print("Byeasian for ANN is unstable, using random search instead (no BayesSearchCV).")
+        _validate_search_space(search_space)
+
+        # keep it small on test_mode
+        n_iter = 3 if test_mode else int(ann_random_search_iter)
+
+        best_params = None
+        best_score = -np.inf
+
+        # CV loop (comparable to BayesSearchCV scoring)
+        n_splits = 2 if test_mode else 5
+        cv_strategy = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+        for i in range(n_iter):
+            params_i = sample_one_params(search_space, random_state=random_state + i)
+            pipeline_i = clone(pipeline)
+            pipeline_i.set_params(**params_i)
+
+            fold_scores = []
+            for train_idx, val_idx in cv_strategy.split(x_train, y_train):
+                X_tr = x_train.iloc[train_idx]
+                y_tr = y_train.iloc[train_idx]
+                X_va = x_train.iloc[val_idx]
+                y_va = y_train.iloc[val_idx]
+
+                pipeline_i.fit(X_tr, y_tr)
+                y_score = pipeline_i.predict_proba(X_va)[:, 1]
+                fold_scores.append(average_precision_score(y_va, y_score))
+
+            mean_score = float(np.mean(fold_scores))
+
+            if mean_score > best_score:
+                best_score = mean_score
+                best_params = params_i
+
+        if best_params is None:
+            raise RuntimeError("ANN random search failed to produce best_params.")
+
+        best_pipeline = clone(pipeline)
+        best_pipeline.set_params(**best_params)
+        best_pipeline.fit(x_train, y_train)
+
+        return best_pipeline, best_params, best_score
+
+    # -------------------------------
+    # NON-ANN: normal BayesSearchCV mode
+    # -------------------------------
     _validate_search_space(search_space)
 
     n_iter = 1 if test_mode else 50
     n_splits = 2 if test_mode else 5
-
     cv_strategy = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     if BayesSearchCV is None:
@@ -355,8 +416,7 @@ def get_train_model(
             f"Original error: {_skopt_import_error}"
         )
 
-    # Important: n_points=1 avoids batch ask/tell path that often triggers the bounds bug
-    n_jobs = 1 if algorithm in {"ANN", "BagNN", "AdaBoost-NN"} else -1
+    n_jobs = 1 if algorithm in {"BagNN", "AdaBoost-NN"} else -1
 
     bayes_search = BayesSearchCV(
         estimator=pipeline,
@@ -367,7 +427,7 @@ def get_train_model(
         random_state=random_state,
         verbose=0,
         n_jobs=n_jobs,
-        n_points=1,          # <-- critical for older skopt stability
+        n_points=1,
         error_score="raise",
     )
 
@@ -410,6 +470,11 @@ def save_model(path: str, model, environment: str = "local"):
 def load_model(path: str, environment: str = "local"):
     try:
         if environment == "gcp":
+            if gcsfs is None:
+                raise ImportError(
+                    "gcsfs is required for loading from GCP but is not installed. "
+                    f"Original error: {_gcsfs_import_error}"
+                )
             fs = gcsfs.GCSFileSystem()
             with fs.open(f"{path}", "rb") as f:
                 model = joblib.load(f)
