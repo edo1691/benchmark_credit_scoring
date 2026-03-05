@@ -261,14 +261,14 @@ def merge_xai_results(
     datasets_to_run: list,
     imbalance_levels: list,
     model_choices: list,
+    normalize: bool = True,
 ):
-    
+
     for dataset in datasets_to_run:
 
         print(f"\nProcessing dataset: {dataset}")
 
         dfs = []
-
         out_dir = data_dir / "output" / dataset
 
         for imbalance in imbalance_levels:
@@ -285,7 +285,7 @@ def merge_xai_results(
 
                 df = pd.read_csv(file_path)
 
-                # add metadata
+                # metadata
                 df["dataset"] = dataset
                 df["imbalance"] = imbalance
                 df["model"] = model
@@ -297,6 +297,27 @@ def merge_xai_results(
             continue
 
         df_final = pd.concat(dfs, ignore_index=True)
+
+        # -----------------------------
+        # Normalize numeric columns
+        # per dataset
+        # -----------------------------
+        if normalize:
+
+            numeric_cols = df_final.select_dtypes(include="number").columns.tolist()
+
+            # metadata columns that should not be normalized
+            exclude_cols = ["imbalance"]
+
+            numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
+
+            for col in numeric_cols:
+
+                min_val = df_final[col].min()
+                max_val = df_final[col].max()
+
+                if max_val > min_val:
+                    df_final[col] = (df_final[col] - min_val) / (max_val - min_val)
 
         save_path = out_dir / f"{dataset}_xai_all_models.csv"
         df_final.to_csv(save_path, index=False)
