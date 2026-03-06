@@ -113,195 +113,230 @@ import pandas as pd
 from sklearn.base import clone
 
 
+import numpy as np
+import pandas as pd
+from sklearn.base import clone
+
+
 def get_train_iterations_xai(
-    pipeline, x_train, x_test, y_train, n_iterations=5, percentage=90
+    pipeline,
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    n_iterations: int = 5,
+    percentage: float = 90,
 ):
     """
-    Same logic as your original function, but with index-safe handling to avoid
-    accidental row-count / alignment issues.
+    Train the same model multiple times on different random subsamples of the TRAIN set,
+    compute SHAP values on the TEST set for each iteration, and then compute global + local
+    stability summaries.
 
-    NOTE: get_prediction_xai(...) is unchanged (called exactly as before).
+    Returns
+    -------
+    df_shap : pd.DataFrame
+        SHAP values for the test set across all iterations.
+        Shape ~ (n_iterations * len(x_test), n_features + metadata)
+
+    df_ranking_local : pd.DataFrame
+        Local rank stability per (test_row_index, feature).
+
+    extra : pd.DataFrame
+        Extra output returned by compute_rankstab_local_from_shap (kept as in your logic).
+
+    df_ranking_global : pd.DataFrame
+        Global ranking per iteration + rankstab_global per feature.
+
+    df_resume_local : pd.DataFrame
+        Local ranking summary merged with global feature_importance.
+
+    df_resume_global : pd.DataFrame
+        Global summary including rankstab_global, value_stab, feature_importance and weights.
+
+    df_resume : pd.DataFrame
+        Final summary merging global and aggregated local stability per feature.
+
+    Notes
+    -----
+    - get_prediction_xai(...) is called exactly as you already have it.
+    - The main robustness change is preserving indices through preprocessing and sampling.
     """
 
-    # -----------------------------
-    # Preprocess (keep indices!)
-    # -----------------------------
-    x_train_preprocessed = pipeline.named_steps["preprocessing"].transform(x_train)
-    x_test_preprocessed = pipeline.named_steps["preprocessing"].transform(x_test)
+    # ---------------------------------------------------------------------
+    # 1) Preprocess train/test while preserving original indices
+    # ---------------------------------------------------------------------
+    x_train_pre = pipeline.named_steps["preprocessing"].transform(x_train)
+    x_test_pre = pipeline.named_steps["preprocessing"].transform(x_test)
 
-    # Ensure DataFrame with original indices (critical for stable sampling + alignment)
-    if not isinstance(x_train_preprocessed, pd.DataFrame):
-        x_train_preprocessed = pd.DataFrame(x_train_preprocessed, index=x_train.index)
+    # Force DataFrames with the original indices (prevents alignment/row-loss issues)
+    if not isinstance(x_train_pre, pd.DataFrame):
+        x_train_pre = pd.DataFrame(x_train_pre, index=x_train.index)
     else:
-        # make sure it uses x_train index (in case transform changed it)
-        x_train_preprocessed = x_train_preprocessed.copy()
-        x_train_preprocessed.index = x_train.index
+        x_train_pre = x_train_pre.copy()
+        x_train_pre.index = x_train.index
 
-    if not isinstance(x_test_preprocessed, pd.DataFrame):
-        x_test_preprocessed = pd.DataFrame(x_test_preprocessed, index=x_test.index)
+    if not isinstance(x_test_pre, pd.DataFrame):
+        x_test_pre = pd.DataFrame(x_test_pre, index=x_test.index)
     else:
-        x_test_preprocessed = x_test_preprocessed.copy()
-        x_test_preprocessed.index = x_test.index
+        x_test_pre = x_test_pre.copy()
+        x_test_pre.index = x_test.index
 
-    feature_names = (
-        x_train_preprocessed.columns.tolist()
-        if hasattr(x_train_preprocessed, "columns")
-        else None
-    )
+    feature_names = x_train_pre.columns.tolist() if hasattr(x_train_pre, "columns") else None
 
-    shap_predicted_df_full = []
+    # ---------------------------------------------------------------------
+    # 2) SHAP across iterations (train on subsamples, explain full test set)
+    # ---------------------------------------------------------------------
+    sample_size = int(len(x_train_pre) * (percentage / 100))
+    expected_test_rows = len(x_test_pre)
 
-    sample_size = int(len(x_train_preprocessed) * (percentage / 100))
-    unique_samples = []
-
-    # Optional: keep expected test size for sanity checks
-    expected_test_rows = len(x_test_preprocessed)
+    shap_frames = []
+    seen_samples = []  # keep your "ensure unique sample" logic
 
     for iteration in range(n_iterations):
 
-        # -----------------------------
-        # Sample rows from train (preserve index)
-        # -----------------------------
+        # --- 2.1 sample a unique training subset (by iteration seed) ---
         while True:
-            sampled_data = x_train_preprocessed.sample(
-                n=sample_size, random_state=iteration, replace=False
-            )
+            sampled_x = x_train_pre.sample(n=sample_size, random_state=iteration, replace=False)
 
-            # Your uniqueness check (kept)
-            if not any(
-                sampled_data.equals(existing_sample)
-                for existing_sample in unique_samples
-            ):
-                unique_samples.append(sampled_data)
+            # keep your uniqueness check
+            if not any(sampled_x.equals(prev) for prev in seen_samples):
+                seen_samples.append(sampled_x)
                 break
 
-        # Match target values USING .loc (index-safe)
-        sampled_y = y_train.loc[sampled_data.index]
+        # match y using index-safe .loc
+        sampled_y = y_train.loc[sampled_x.index]
 
-        # -----------------------------
-        # Train cloned model
-        # -----------------------------
+        # --- 2.2 train a cloned model on the sampled data ---
         model_clone = clone(pipeline.named_steps["model"])
-        model_clone.fit(sampled_data, sampled_y)
+        model_clone.fit(sampled_x, sampled_y)
 
-        # Fresh SHAP transformer with the new model
+        # --- 2.3 build SHAP transformer for this specific fitted model ---
         shap_transformer = SHAPTransformer(model_clone)
-        shap_transformer.fit(sampled_data)
+        shap_transformer.fit(sampled_x)
 
-        # -----------------------------
-        # Predict SHAP on the FULL test set
-        # (your function unchanged)
-        # -----------------------------
-        shap_predicted_df = get_prediction_xai(
+        # --- 2.4 compute SHAP for the full test set (your prediction function unchanged) ---
+        shap_df = get_prediction_xai(
             pipeline,
             shap_transformer,
-            x_test_preprocessed,
+            x_test_pre,
             feature_names,
             preprocessed_data=True,
         )
 
-        # -----------------------------
-        # Defensive alignment (does NOT change your prediction function)
-        # If get_prediction_xai returns same number of rows but resets index,
-        # we restore the test index to keep consistency downstream.
-        # If it returns fewer rows, we do NOT force it (we warn).
-        # -----------------------------
-        if len(shap_predicted_df) == expected_test_rows:
-            shap_predicted_df = shap_predicted_df.copy()
-            shap_predicted_df.index = x_test_preprocessed.index
+        # If get_prediction_xai returns same number of rows but reset index, restore it.
+        if len(shap_df) == expected_test_rows:
+            shap_df = shap_df.copy()
+            shap_df.index = x_test_pre.index
         else:
             print(
-                f"[WARN] iteration={iteration}: shap_predicted_df rows={len(shap_predicted_df)} "
-                f"!= expected_test_rows={expected_test_rows}. "
-                f"Row reduction is happening inside get_prediction_xai / SHAP pipeline."
+                f"[WARN] iter={iteration}: get_prediction_xai returned {len(shap_df)} rows "
+                f"(expected {expected_test_rows}). Row loss is happening inside get_prediction_xai/SHAP."
             )
 
-        # Add iteration and index columns
-        shap_predicted_df["n_iteration"] = iteration
-        shap_predicted_df["index"] = shap_predicted_df.index
+        # add metadata columns
+        shap_df["n_iteration"] = iteration
+        shap_df["index"] = shap_df.index
 
-        shap_predicted_df_full.append(shap_predicted_df)
+        shap_frames.append(shap_df)
 
-    # Concatenate all iterations
-    df_shap = pd.concat(shap_predicted_df_full, ignore_index=True)
+    # stack all iterations
+    df_shap = pd.concat(shap_frames, ignore_index=True)
 
-    # All the shap values change to positive
+    # ---------------------------------------------------------------------
+    # 3) Prepare absolute SHAP values for stability computations
+    # ---------------------------------------------------------------------
     df_abs = df_shap.abs()
-    df_abs = df_abs.drop(columns=["base_value"])
+    print(df_abs.head())  # Debug: check the structure of df_abs
 
-    df_values_global, df_ranking_global = compute_global_sra_rankstab(
-        df_abs,
-        drop_cols=["base_value"]  # optional
-        )
+    # Drop base_value once here (and we will not drop it again later)
+    if "base_value" in df_abs.columns:
+        df_abs = df_abs.drop(columns=["base_value"])
 
-    # Start SMLE
-    # Rank the columns for each row with the highest value first, excluding specified columns
-    rankstab_records, extra = compute_rankstab_local_from_shap(df_abs)
-
-    df_resume_stab_global = df_ranking_global.reset_index()
-    df_resume_stab_global = df_resume_stab_global[["index", "rankstab_global"]]
-
+    # ---------------------------------------------------------------------
+    # 4) GLOBAL stability: SRA ranking + rankstab_global + value_stab
+    # ---------------------------------------------------------------------
+    # Your compute_global_sra_rankstab expects df_shap-like input with n_iteration/index
+    # It will ignore identifier columns and compute per-feature global stats.
+    df_values_global = compute_df_values_global(df_abs)
+   
+    # value stability based on df_values_global
     value_stab_global = compute_value_stab(df_values_global)
-    # Compute the mean of the feature columns (excluding 'index' and 'value_stab')
+
+    # feature importance = mean importance across iterations
     df_resume_cv_global = value_stab_global.copy()
-    df_resume_cv_global["feature_importance"] = df_resume_cv_global.drop(
-        columns=["feature", "value_stab"]
-    ).mean(axis=1)
-    # Select only the desired columns
-    df_resume_cv_global = df_resume_cv_global[
-        ["feature", "feature_importance", "value_stab"]
-    ]
+    print(df_resume_cv_global.head())  # Debug: check the structure of df_resume_cv_global
 
-    df_resume_global = df_resume_stab_global.merge(
-        df_resume_cv_global, left_on="index", right_on="feature", how="left"
+    df_resume_cv_global["feature_importance"] = (
+        df_resume_cv_global.drop(columns=["feature", "value_stab"]).mean(axis=1)
     )
+    df_filtered = df_resume_cv_global[(df_resume_cv_global["feature_importance"] > 0)]
 
-    # Drop the 'index' column
-    df_resume_global = df_resume_global.drop(columns="index")
-    # Convert feature_importance to relative percentage
+    df_resume_cv_global = df_resume_cv_global[["feature", "feature_importance", "value_stab"]]
+
+    # rankstab_global summary: feature + rankstab_global
+    df_ranking_global = compute_df_ranking_global(df_filtered)
+    # NOTE: compute_global_sra_rankstab returns "feature" column (not "index")
+    df_resume_stab_global = df_ranking_global[["feature", "rankstab_global"]].copy()
+
+    # Merge global rank stability with value stability + importance
+    df_resume_global = df_resume_stab_global.merge(df_resume_cv_global, on="feature", how="left")
+
+    # Convert feature_importance to percentage
     total_importance = df_resume_global["feature_importance"].sum()
-    df_resume_global["feature_importance"] = (
-        df_resume_global["feature_importance"] / total_importance * 100
-    )
-    # Create rankstab_weight column
+    if total_importance and total_importance != 0:
+        df_resume_global["feature_importance"] = df_resume_global["feature_importance"] / total_importance * 100
+    else:
+        df_resume_global["feature_importance"] = 0.0
+
+    # Weighted measures (your exact logic)
     df_resume_global["rankstab_global_weight"] = (
         df_resume_global["rankstab_global"] * df_resume_global["feature_importance"]
     )
-    # Create rankstab_weight column
     df_resume_global["value_stab_weight"] = (
         df_resume_global["value_stab"] * df_resume_global["feature_importance"]
     )
 
-    # df_resume_global = df_resume_global.reset_index()
-    # df_resume_global = df_resume_global.rename(columns={'index': 'feature'})
-    print(df_resume_global)
-    print(list(df_resume_global.head(0)))
+    # ---------------------------------------------------------------------
+    # 5) LOCAL stability: SMLE rank stability per (index, feature)
+    # ---------------------------------------------------------------------
+    # Your compute_rankstab_local_from_shap returns:
+    #   - rankstab_records: list[dict] with columns: feature, index, rankstab_local
+    #   - extra: something else you want to keep
+    rankstab_records, extra = compute_rankstab_local_from_shap(df_abs)
+
     df_ranking_local = pd.DataFrame(rankstab_records)
     extra = pd.DataFrame(extra)
-    df_ranking_local["feature"] = df_ranking_local["feature"].astype("int64")
-    extra["feature"] = extra["feature"].astype("int64")
-    print(df_ranking_local.head())
 
+    # Your downstream expects int feature ids (kept)
+    if not df_ranking_local.empty and "feature" in df_ranking_local.columns:
+        df_ranking_local["feature"] = df_ranking_local["feature"].astype("int64")
+    if not extra.empty and "feature" in extra.columns:
+        extra["feature"] = extra["feature"].astype("int64")
+
+    # Merge local rank stability with global feature importance
     df_resume_local = df_ranking_local.merge(df_resume_global, on="feature", how="left")
-    print(df_resume_local.head())
-    print(list(df_resume_local.head(0)))
-    df_resume_local = df_resume_local[
-        ["feature", "index", "feature_importance", "rankstab_local"]
-    ]
 
-    # Create rankstab_weight column
+    # Keep only what you used later
+    df_resume_local = df_resume_local[["feature", "index", "feature_importance", "rankstab_local"]].copy()
+
+    # Local weighted stability
     df_resume_local["rankstab_local_weight"] = (
         df_resume_local["rankstab_local"] * df_resume_local["feature_importance"]
     )
 
-    df_resume_local_agg = df_resume_local.groupby(["index"]).sum()
-    df_resume_local_agg = df_resume_local_agg.drop(
-        columns=["feature", "feature_importance"]
-    )
-    df_resume_local_agg = df_resume_local_agg.reset_index().rename(
-        columns={"index": "feature"}
-    )
+    # Aggregate local stability per "index" (your logic)
+    df_resume_local_agg = df_resume_local.groupby(["index"], as_index=True).sum(numeric_only=True)
 
+    # In your original code you drop these after sum
+    for col in ["feature", "feature_importance"]:
+        if col in df_resume_local_agg.columns:
+            df_resume_local_agg = df_resume_local_agg.drop(columns=[col])
+
+    # Rename aggregated index to "feature" so it can merge with df_resume_global
+    df_resume_local_agg = df_resume_local_agg.reset_index().rename(columns={"index": "feature"})
+
+    # ---------------------------------------------------------------------
+    # 6) Final resume = global resume + aggregated local stability
+    # ---------------------------------------------------------------------
     df_resume = df_resume_global.merge(df_resume_local_agg, on="feature", how="left")
 
     return (
@@ -366,126 +401,99 @@ def compute_rankstab_local_from_shap(
     return out, long
 
 
-def compute_global_sra_rankstab(
-    df_shap: pd.DataFrame,
+def compute_df_values_global(
+    df_shap_or_abs: pd.DataFrame,
     iteration_col: str = "n_iteration",
     index_col: str = "index",
     drop_cols: list = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Compute global SRA ranking + rank stability from a SHAP-per-iteration dataframe.
+    Build df_values_global (Global SRA values table).
 
-    Parameters
-    ----------
-    df_shap : pd.DataFrame
-        Input dataframe containing SHAP values for test rows, repeated across iterations.
-        Expected columns:
-          - iteration_col (e.g. 'n_iteration')
-          - index_col (e.g. 'index')  -> identifies the test row/observation
-          - feature columns           -> SHAP values per feature
-        May also include extra columns (e.g. 'base_value').
+    Logic (same as your code):
+      1) (Optionally) drop columns like 'base_value'
+      2) Take absolute values for feature columns
+      3) Group by iteration and SUM feature values across all test rows (different indices)
+      4) Transpose so rows = features, columns = iterations
 
-    iteration_col : str
-        Name of the iteration column.
-
-    index_col : str
-        Name of the observation identifier column.
-
-    drop_cols : list[str] | None
-        Optional extra columns to drop before processing (e.g. ['base_value']).
-
-    Returns
-    -------
-    df_values_global : pd.DataFrame
-        Table with one row per feature and one column per iteration.
-        Values = summed |SHAP| across all test rows (indexes) for that iteration.
-
-        Columns: ['feature', <iter0>, <iter1>, ...].
-
-    df_ranking_global : pd.DataFrame
-        Same shape as df_values_global, but entries are ranks (1 = most important),
-        plus an extra column 'rankstab_global' = stability of ranks across iterations.
-
-        Columns: ['feature', <iter0>, <iter1>, ..., 'rankstab_global'].
+    Output
+    ------
+    df_values_global:
+      columns: ['feature', <iter0>, <iter1>, ...]
+      each cell = summed |SHAP| for that feature in that iteration
     """
+    df = df_shap_or_abs.copy()
 
-    # -----------------------------
-    # 0) Defensive checks
-    # -----------------------------
-    if iteration_col not in df_shap.columns:
-        raise ValueError(f"Missing '{iteration_col}' in df_shap")
-    if index_col not in df_shap.columns:
-        raise ValueError(f"Missing '{index_col}' in df_shap")
-
-    df = df_shap.copy()
-
-    # Drop unwanted columns (e.g. base_value)
+    # drop optional columns safely
     if drop_cols:
-        existing = [c for c in drop_cols if c in df.columns]
-        if existing:
-            df = df.drop(columns=existing)
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-    # -----------------------------
-    # 1) Absolute SHAP values
-    #    (we only abs the feature columns)
-    # -----------------------------
-    feature_cols = [c for c in df.columns if c not in [iteration_col, index_col]]
+    # feature columns = everything except metadata
+    meta_cols = {iteration_col, index_col}
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+
+    # abs only on feature columns
     df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").abs()
 
-    # -----------------------------
-    # 2) Global aggregation per iteration (SRA)
-    #    IMPORTANT FIX:
-    #    We group by iteration and sum across rows (different indexes),
-    #    but we MUST NOT sum the index_col (identifier).
-    # -----------------------------
+    # group by iteration and sum across rows (index values)
     df_sum = (
-        df.drop(columns=[index_col])          # drop index id before sum
+        df.drop(columns=[index_col], errors="ignore")
           .groupby(iteration_col, as_index=True)
-          .sum(numeric_only=True)             # sum features across test rows
+          .sum(numeric_only=True)
     )
 
-    # df_sum shape: [n_iterations x n_features]
-    # index: iteration values, columns: features
-
-    # -----------------------------
-    # 3) Convert to feature x iteration table (as you did)
-    # -----------------------------
-    df_transpose = (
+    # transpose -> feature x iteration
+    df_values_global = (
         df_sum.T
-            .reset_index()
-            .rename(columns={"index": "feature"})
+              .reset_index()
+              .rename(columns={"index": "feature"})
     )
 
-    # This is the global importance per iteration
-    # Columns: feature, iter0, iter1, ...
-    df_values_global = df_transpose.copy()
+    return df_values_global
 
-    # -----------------------------
-    # 4) Rank features per iteration
-    #    For each iteration column: higher importance => rank 1
-    # -----------------------------
-    df_ranking_global_mat = df_transpose.drop(columns=["feature"]).rank(
-        axis=0, ascending=False, method="average"
+
+def compute_df_ranking_global(
+    df_values_global: pd.DataFrame,
+    feature_col: str = "feature",
+) -> pd.DataFrame:
+    """
+    Build df_ranking_global (Global ranking per iteration + rankstab_global).
+
+    Logic (same as your code):
+      1) Drop feature column -> matrix [n_features x n_iterations]
+      2) Rank features per iteration (descending)
+      3) For each feature row, compute rankstab_global across iterations:
+           (1/(K-1)) * sum_k (rank_k - mean_rank)^2
+
+    Output
+    ------
+    df_ranking_global:
+      columns: ['feature', <iter0>, <iter1>, ..., 'rankstab_global']
+      ranks are 1..n_features (1 = most important)
+    """
+    if feature_col not in df_values_global.columns:
+        raise ValueError(f"'{feature_col}' not found in df_values_global")
+
+    # rank per iteration column (descending)
+    rank_mat = (
+        df_values_global
+        .drop(columns=[feature_col])
+        .rank(axis=0, ascending=False, method="average")
     )
 
-    # -----------------------------
-    # 5) Rank stability across iterations (per feature)
-    #    Your formula is equivalent to:
-    #      sample variance of ranks across iterations
-    # -----------------------------
-    num_iterations = df_ranking_global_mat.shape[1]
+    num_iterations = rank_mat.shape[1]
     if num_iterations < 2:
         raise ValueError("Need at least 2 iterations to compute rankstab_global.")
 
-    mean_ranks = df_ranking_global_mat.mean(axis=1)
-    rankstab = ((df_ranking_global_mat.sub(mean_ranks, axis=0)) ** 2).sum(axis=1) / (num_iterations - 1)
+    # vectorized version of your rankstab formula
+    mean_ranks = rank_mat.mean(axis=1)
+    rankstab = ((rank_mat.sub(mean_ranks, axis=0)) ** 2).sum(axis=1) / (num_iterations - 1)
 
-    # Build final df_ranking_global output
-    df_ranking_global = df_ranking_global_mat.copy()
+    df_ranking_global = rank_mat.copy()
+    df_ranking_global.insert(0, feature_col, df_values_global[feature_col].values)
     df_ranking_global["rankstab_global"] = rankstab.values
-    df_ranking_global.insert(0, "feature", df_transpose["feature"].values)
 
-    return df_values_global, df_ranking_global
+    return df_ranking_global
 
 
 def compute_value_stab(df: pd.DataFrame, min_presence: int = 2) -> pd.DataFrame:
