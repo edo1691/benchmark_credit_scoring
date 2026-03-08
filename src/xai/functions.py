@@ -245,7 +245,6 @@ def get_train_iterations_xai(
     # 3) Prepare absolute SHAP values for stability computations
     # ---------------------------------------------------------------------
     df_abs = df_shap.abs()
-    print(df_abs.head())  # Debug: check the structure of df_abs
 
     # Drop base_value once here (and we will not drop it again later)
     if "base_value" in df_abs.columns:
@@ -263,7 +262,6 @@ def get_train_iterations_xai(
 
     # feature importance = mean importance across iterations
     df_resume_cv_global = value_stab_global.copy()
-    print(df_resume_cv_global.head())  # Debug: check the structure of df_resume_cv_global
 
     df_resume_cv_global["feature_importance"] = (
         df_resume_cv_global.drop(columns=["feature", "value_stab"]).mean(axis=1)
