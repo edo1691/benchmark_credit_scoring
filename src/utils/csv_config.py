@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 import pandas as pd
 
+
 DEFAULT_CSV_CONFIG: Dict[str, Dict[str, Any]] = {
     "german": {
         "sep": r"\s+",
@@ -264,14 +265,15 @@ def merge_xai_results(
     datasets_to_run: list[str],
     imbalance_levels: list,
     model_choices: list[str],
+    file_types: list[str] = None,
     normalize: bool = True,
     normalization_suffix: str = "_normalized",
 ):
     """
-    Merge XAI local result files across imbalance levels and models.
+    Merge XAI result files across imbalance levels and models.
 
-    For each dataset, this function:
-    1. Reads all available local XAI result files
+    For each dataset and each file_type, this function:
+    1. Reads all available XAI result files
     2. Merges them into one raw dataframe
     3. Optionally creates a normalized version
     4. Saves both raw and normalized outputs
@@ -286,6 +288,11 @@ def merge_xai_results(
         Imbalance values to include.
     model_choices : list[str]
         Model names to include.
+    file_types : list[str] | None
+        File types to merge, e.g.:
+        ["resume_local", "resume_global", "summary"]
+
+        If None, defaults to ["resume_local"].
     normalize : bool, default=True
         Whether to create and save a normalized output.
     normalization_suffix : str, default="_normalized"
@@ -294,105 +301,116 @@ def merge_xai_results(
     Returns
     -------
     dict
-        Dictionary keyed by dataset with:
+        Nested dictionary keyed by dataset and file_type:
         {
             dataset_name: {
-                "raw": raw_dataframe,
-                "normalized": normalized_dataframe or None
+                file_type: {
+                    "raw": raw_dataframe,
+                    "normalized": normalized_dataframe or None
+                }
             }
         }
     """
+    if file_types is None:
+        file_types = ["resume_local"]
+
     results = {}
 
     for dataset in datasets_to_run:
         print(f"\nProcessing dataset: {dataset}")
-
-        dfs = []
         out_dir = data_dir / "output" / dataset / "xai"
+        results[dataset] = {}
 
-        for imbalance in imbalance_levels:
-            dataset_variant = f"{dataset}_{imbalance}"
+        for file_type in file_types:
+            print(f"  Merging file type: {file_type}")
+            dfs = []
 
-            for model in model_choices:
-                file_path = (
+            for imbalance in imbalance_levels:
+                dataset_variant = f"{dataset}_{imbalance}"
+
+                for model in model_choices:
+                    file_path = (
+                        out_dir
+                        / model
+                        / dataset_variant
+                        / "metrics"
+                        / f"{dataset_variant}_{model}_{file_type}.csv"
+                    )
+
+                    if not file_path.exists():
+                        print(f"Missing file: {file_path}")
+                        continue
+
+                    df = pd.read_csv(file_path)
+
+                    # Add metadata
+                    df["dataset"] = dataset
+                    df["imbalance"] = imbalance
+                    df["model"] = model
+
+                    dfs.append(df)
+
+            if not dfs:
+                print(f"No files found for dataset={dataset}, file_type={file_type}")
+                results[dataset][file_type] = {
+                    "raw": None,
+                    "normalized": None,
+                }
+                continue
+
+            # -----------------------------
+            # Raw merged output
+            # -----------------------------
+            df_raw = pd.concat(dfs, ignore_index=True)
+
+            raw_save_path = out_dir / f"{dataset}_xai_all_models_{file_type}.csv"
+            df_raw.to_csv(raw_save_path, index=False)
+            print(f"Saved raw merged dataset: {raw_save_path}")
+
+            df_normalized = None
+
+            # -----------------------------
+            # Normalized output
+            # -----------------------------
+            if normalize:
+                df_normalized = df_raw.copy()
+
+                # Select numeric columns
+                numeric_cols = df_normalized.select_dtypes(include="number").columns.tolist()
+
+                # Exclude metadata / identifiers / columns you do not want to normalize
+                exclude_cols = {
+                    "imbalance",
+                    "feature",
+                    "index",
+                    "feature_importance",
+                }
+
+                numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
+
+                for col in numeric_cols:
+                    min_val = df_normalized[col].min()
+                    max_val = df_normalized[col].max()
+
+                    # Avoid division by zero for constant columns
+                    if pd.notna(min_val) and pd.notna(max_val):
+                        if max_val > min_val:
+                            df_normalized[col] = (
+                                (df_normalized[col] - min_val) / (max_val - min_val)
+                            )
+                        else:
+                            df_normalized[col] = 0.0
+
+                normalized_save_path = (
                     out_dir
-                    / f"{model}"
-                    / f"{dataset_variant}"
-                    / "metrics"
-                    / f"{dataset_variant}_{model}_resume_local.csv"
+                    / f"{dataset}_xai_all_models_{file_type}{normalization_suffix}.csv"
                 )
+                df_normalized.to_csv(normalized_save_path, index=False)
+                print(f"Saved normalized merged dataset: {normalized_save_path}")
 
-                if not file_path.exists():
-                    print(f"Missing file: {file_path}")
-                    continue
-
-                df = pd.read_csv(file_path)
-
-                # Add metadata
-                df["dataset"] = dataset
-                df["imbalance"] = imbalance
-                df["model"] = model
-
-                dfs.append(df)
-
-        if not dfs:
-            print(f"No files found for {dataset}")
-            results[dataset] = {"raw": None, "normalized": None}
-            continue
-
-        # -----------------------------
-        # Raw merged output
-        # -----------------------------
-        df_raw = pd.concat(dfs, ignore_index=True)
-
-        raw_save_path = out_dir / f"{dataset}_xai_all_models.csv"
-        df_raw.to_csv(raw_save_path, index=False)
-        print(f"Saved raw merged dataset: {raw_save_path}")
-
-        df_normalized = None
-
-        # -----------------------------
-        # Normalized output
-        # -----------------------------
-        if normalize:
-            df_normalized = df_raw.copy()
-
-            # Select numeric columns
-            numeric_cols = df_normalized.select_dtypes(include="number").columns.tolist()
-
-            # Exclude metadata / identifier / already meaningful scale columns
-            exclude_cols = {
-                "imbalance",
-                "feature",
-                "index",
-                "feature_importance",
+            results[dataset][file_type] = {
+                "raw": df_raw,
+                "normalized": df_normalized,
             }
-
-            numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
-
-            for col in numeric_cols:
-                min_val = df_normalized[col].min()
-                max_val = df_normalized[col].max()
-
-                # Avoid division by zero for constant columns
-                if pd.notna(min_val) and pd.notna(max_val):
-                    if max_val > min_val:
-                        df_normalized[col] = (
-                            (df_normalized[col] - min_val) / (max_val - min_val)
-                        )
-                    else:
-                        # constant column -> set to 0.0
-                        df_normalized[col] = 0.0
-
-            normalized_save_path = (
-                out_dir / f"{dataset}_xai_all_models{normalization_suffix}.csv"
-            )
-            df_normalized.to_csv(normalized_save_path, index=False)
-            print(f"Saved normalized merged dataset: {normalized_save_path}")
-
-        results[dataset] = {
-            "raw": df_raw,
-            "normalized": df_normalized,
-        }
 
     return
