@@ -277,7 +277,7 @@ def merge_xai_results(
 
             for model in model_choices:
 
-                file_path = out_dir / f"{dataset_variant}_{model}_xai_iterations.csv"
+                file_path = out_dir / f"{dataset_variant}_{model}_xai.csv" / f"{dataset_variant}_{model}_resume_local.csv"
 
                 if not file_path.exists():
                     print(f"Missing file: {file_path}")

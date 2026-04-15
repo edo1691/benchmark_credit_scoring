@@ -110,15 +110,197 @@ def get_prediction_xai(
 
 
 import pandas as pd
-from sklearn.base import clone
 
 
-import numpy as np
-import pandas as pd
-from sklearn.base import clone
+def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
+    """
+    Compute global and local XAI stability metrics from stacked SHAP values.
+
+    Parameters
+    ----------
+    df_shap : pd.DataFrame
+        Stacked SHAP values across iterations.
+        Expected to contain:
+        - SHAP feature columns
+        - n_iteration
+        - index
+        - optionally base_value
+
+    Returns
+    -------
+    df_ranking_local : pd.DataFrame
+        Local rank stability per (index, feature)
+
+    extra : pd.DataFrame
+        Extra output returned by compute_rankstab_local_from_shap
+
+    df_ranking_global : pd.DataFrame
+        Global ranking summary per feature
+
+    df_resume_local : pd.DataFrame
+        Local stability merged with global feature importance
+
+    df_resume_global : pd.DataFrame
+        Global summary including rankstab_global, value_stab, feature_importance
+        and weighted measures
+
+    df_resume : pd.DataFrame
+        Final feature-level summary merging global and aggregated local stability
+    """
+
+    # ---------------------------------------------------------------------
+    # 1) Validate required metadata columns
+    # ---------------------------------------------------------------------
+    required_cols = {"n_iteration", "index"}
+    missing_cols = required_cols - set(df_shap.columns)
+    if missing_cols:
+        raise ValueError(
+            f"df_shap is missing required columns: {sorted(missing_cols)}"
+        )
+
+    # ---------------------------------------------------------------------
+    # 2) Prepare absolute SHAP values
+    # ---------------------------------------------------------------------
+    df_abs = df_shap.copy()
+
+    meta_cols = {"n_iteration", "index", "base_value"}
+    feature_cols = [col for col in df_abs.columns if col not in meta_cols]
+
+    if not feature_cols:
+        raise ValueError("No feature columns found in df_shap.")
+
+    df_abs[feature_cols] = df_abs[feature_cols].abs()
+
+    if "base_value" in df_abs.columns:
+        df_abs = df_abs.drop(columns=["base_value"])
+
+    # ---------------------------------------------------------------------
+    # 3) GLOBAL stability
+    # ---------------------------------------------------------------------
+    df_values_global = compute_df_values_global(df_abs)
+    value_stab_global = compute_value_stab(df_values_global)
+
+    df_resume_cv_global = value_stab_global.copy()
+
+    metric_cols = [
+        col for col in df_resume_cv_global.columns
+        if col not in ["feature", "value_stab"]
+    ]
+
+    if not metric_cols:
+        raise ValueError(
+            "compute_value_stab(df_values_global) did not return iteration/value columns."
+        )
+
+    df_resume_cv_global["feature_importance"] = (
+        df_resume_cv_global[metric_cols].mean(axis=1)
+    )
+
+    df_filtered = df_resume_cv_global[
+        df_resume_cv_global["feature_importance"] > 0
+    ].copy()
+
+    df_resume_cv_global = df_resume_cv_global[
+        ["feature", "feature_importance", "value_stab"]
+    ].copy()
+
+    df_ranking_global = compute_df_ranking_global(df_filtered)
+    df_resume_stab_global = df_ranking_global[
+        ["feature", "rankstab_global"]
+    ].copy()
+
+    # Make dtype consistent
+    df_resume_cv_global["feature"] = df_resume_cv_global["feature"].astype(str)
+    df_ranking_global["feature"] = df_ranking_global["feature"].astype(str)
+    df_resume_stab_global["feature"] = df_resume_stab_global["feature"].astype(str)
+
+    df_resume_global = df_resume_stab_global.merge(
+        df_resume_cv_global,
+        on="feature",
+        how="left"
+    )
+
+    total_importance = df_resume_global["feature_importance"].sum()
+    if total_importance != 0:
+        df_resume_global["feature_importance"] = (
+            df_resume_global["feature_importance"] / total_importance * 100
+        )
+    else:
+        df_resume_global["feature_importance"] = 0.0
+
+    df_resume_global["rankstab_global_weight"] = (
+        df_resume_global["rankstab_global"] * df_resume_global["feature_importance"]
+    )
+    df_resume_global["value_stab_weight"] = (
+        df_resume_global["value_stab"] * df_resume_global["feature_importance"]
+    )
+
+    # ---------------------------------------------------------------------
+    # 4) LOCAL stability
+    # ---------------------------------------------------------------------
+    rankstab_records, extra = compute_rankstab_local_from_shap(df_abs)
+
+    df_ranking_local = pd.DataFrame(rankstab_records)
+    extra = pd.DataFrame(extra)
+
+    if not df_ranking_local.empty:
+        if "feature" not in df_ranking_local.columns:
+            raise ValueError("df_ranking_local does not contain a 'feature' column.")
+        if "index" not in df_ranking_local.columns:
+            raise ValueError("df_ranking_local does not contain an 'index' column.")
+        if "rankstab_local" not in df_ranking_local.columns:
+            raise ValueError("df_ranking_local does not contain a 'rankstab_local' column.")
+
+        df_ranking_local["feature"] = df_ranking_local["feature"].astype(str)
+
+    if not extra.empty and "feature" in extra.columns:
+        extra["feature"] = extra["feature"].astype(str)
+
+    df_resume_global["feature"] = df_resume_global["feature"].astype(str)
+
+    df_resume_local = df_ranking_local.merge(
+        df_resume_global,
+        on="feature",
+        how="left"
+    )
+
+    df_resume_local = df_resume_local[
+        ["feature", "index", "feature_importance", "rankstab_local"]
+    ].copy()
+
+    df_resume_local["rankstab_local_weight"] = (
+        df_resume_local["rankstab_local"] * df_resume_local["feature_importance"]
+    )
+
+    # Aggregate local stability by feature
+    df_resume_local_agg = (
+        df_resume_local.groupby("feature", as_index=False)
+        .agg({
+            "rankstab_local": "mean",
+            "rankstab_local_weight": "mean"
+        })
+    )
+
+    # ---------------------------------------------------------------------
+    # 5) Final summary
+    # ---------------------------------------------------------------------
+    df_resume = df_resume_global.merge(
+        df_resume_local_agg,
+        on="feature",
+        how="left"
+    )
+
+    return (
+        df_ranking_local,
+        extra,
+        df_ranking_global,
+        df_resume_local,
+        df_resume_global,
+        df_resume,
+    )
 
 
-def get_train_iterations_xai(
+def get_train_iterations_shap(
     pipeline,
     x_train: pd.DataFrame,
     x_test: pd.DataFrame,
@@ -127,38 +309,13 @@ def get_train_iterations_xai(
     percentage: float = 90,
 ):
     """
-    Train the same model multiple times on different random subsamples of the TRAIN set,
-    compute SHAP values on the TEST set for each iteration, and then compute global + local
-    stability summaries.
+    Train the same model multiple times on different random subsamples
+    of the TRAIN set and compute SHAP values on the TEST set.
 
     Returns
     -------
     df_shap : pd.DataFrame
-        SHAP values for the test set across all iterations.
-        Shape ~ (n_iterations * len(x_test), n_features + metadata)
-
-    df_ranking_local : pd.DataFrame
-        Local rank stability per (test_row_index, feature).
-
-    extra : pd.DataFrame
-        Extra output returned by compute_rankstab_local_from_shap (kept as in your logic).
-
-    df_ranking_global : pd.DataFrame
-        Global ranking per iteration + rankstab_global per feature.
-
-    df_resume_local : pd.DataFrame
-        Local ranking summary merged with global feature_importance.
-
-    df_resume_global : pd.DataFrame
-        Global summary including rankstab_global, value_stab, feature_importance and weights.
-
-    df_resume : pd.DataFrame
-        Final summary merging global and aggregated local stability per feature.
-
-    Notes
-    -----
-    - get_prediction_xai(...) is called exactly as you already have it.
-    - The main robustness change is preserving indices through preprocessing and sampling.
+        Stacked SHAP values across all iterations.
     """
 
     # ---------------------------------------------------------------------
@@ -167,7 +324,6 @@ def get_train_iterations_xai(
     x_train_pre = pipeline.named_steps["preprocessing"].transform(x_train)
     x_test_pre = pipeline.named_steps["preprocessing"].transform(x_test)
 
-    # Force DataFrames with the original indices (prevents alignment/row-loss issues)
     if not isinstance(x_train_pre, pd.DataFrame):
         x_train_pre = pd.DataFrame(x_train_pre, index=x_train.index)
     else:
@@ -183,37 +339,35 @@ def get_train_iterations_xai(
     feature_names = x_train_pre.columns.tolist() if hasattr(x_train_pre, "columns") else None
 
     # ---------------------------------------------------------------------
-    # 2) SHAP across iterations (train on subsamples, explain full test set)
+    # 2) SHAP across iterations
     # ---------------------------------------------------------------------
     sample_size = int(len(x_train_pre) * (percentage / 100))
     expected_test_rows = len(x_test_pre)
 
     shap_frames = []
-    seen_samples = []  # keep your "ensure unique sample" logic
+    seen_samples = []
 
     for iteration in range(n_iterations):
 
-        # --- 2.1 sample a unique training subset (by iteration seed) ---
         while True:
-            sampled_x = x_train_pre.sample(n=sample_size, random_state=iteration, replace=False)
+            sampled_x = x_train_pre.sample(
+                n=sample_size,
+                random_state=iteration,
+                replace=False
+            )
 
-            # keep your uniqueness check
             if not any(sampled_x.equals(prev) for prev in seen_samples):
                 seen_samples.append(sampled_x)
                 break
 
-        # match y using index-safe .loc
         sampled_y = y_train.loc[sampled_x.index]
 
-        # --- 2.2 train a cloned model on the sampled data ---
         model_clone = clone(pipeline.named_steps["model"])
         model_clone.fit(sampled_x, sampled_y)
 
-        # --- 2.3 build SHAP transformer for this specific fitted model ---
         shap_transformer = SHAPTransformer(model_clone)
         shap_transformer.fit(sampled_x)
 
-        # --- 2.4 compute SHAP for the full test set (your prediction function unchanged) ---
         shap_df = get_prediction_xai(
             pipeline,
             shap_transformer,
@@ -222,130 +376,23 @@ def get_train_iterations_xai(
             preprocessed_data=True,
         )
 
-        # If get_prediction_xai returns same number of rows but reset index, restore it.
         if len(shap_df) == expected_test_rows:
             shap_df = shap_df.copy()
             shap_df.index = x_test_pre.index
         else:
             print(
                 f"[WARN] iter={iteration}: get_prediction_xai returned {len(shap_df)} rows "
-                f"(expected {expected_test_rows}). Row loss is happening inside get_prediction_xai/SHAP."
+                f"(expected {expected_test_rows})."
             )
 
-        # add metadata columns
         shap_df["n_iteration"] = iteration
         shap_df["index"] = shap_df.index
 
         shap_frames.append(shap_df)
 
-    # stack all iterations
     df_shap = pd.concat(shap_frames, ignore_index=True)
 
-    # ---------------------------------------------------------------------
-    # 3) Prepare absolute SHAP values for stability computations
-    # ---------------------------------------------------------------------
-    df_abs = df_shap.abs()
-
-    # Drop base_value once here (and we will not drop it again later)
-    if "base_value" in df_abs.columns:
-        df_abs = df_abs.drop(columns=["base_value"])
-
-    # ---------------------------------------------------------------------
-    # 4) GLOBAL stability: SRA ranking + rankstab_global + value_stab
-    # ---------------------------------------------------------------------
-    # Your compute_global_sra_rankstab expects df_shap-like input with n_iteration/index
-    # It will ignore identifier columns and compute per-feature global stats.
-    df_values_global = compute_df_values_global(df_abs)
-   
-    # value stability based on df_values_global
-    value_stab_global = compute_value_stab(df_values_global)
-
-    # feature importance = mean importance across iterations
-    df_resume_cv_global = value_stab_global.copy()
-
-    df_resume_cv_global["feature_importance"] = (
-        df_resume_cv_global.drop(columns=["feature", "value_stab"]).mean(axis=1)
-    )
-    df_filtered = df_resume_cv_global[(df_resume_cv_global["feature_importance"] > 0)]
-
-    df_resume_cv_global = df_resume_cv_global[["feature", "feature_importance", "value_stab"]]
-
-    # rankstab_global summary: feature + rankstab_global
-    df_ranking_global = compute_df_ranking_global(df_filtered)
-    # NOTE: compute_global_sra_rankstab returns "feature" column (not "index")
-    df_resume_stab_global = df_ranking_global[["feature", "rankstab_global"]].copy()
-
-    # Merge global rank stability with value stability + importance
-    df_resume_global = df_resume_stab_global.merge(df_resume_cv_global, on="feature", how="left")
-
-    # Convert feature_importance to percentage
-    total_importance = df_resume_global["feature_importance"].sum()
-    if total_importance and total_importance != 0:
-        df_resume_global["feature_importance"] = df_resume_global["feature_importance"] / total_importance * 100
-    else:
-        df_resume_global["feature_importance"] = 0.0
-
-    # Weighted measures (your exact logic)
-    df_resume_global["rankstab_global_weight"] = (
-        df_resume_global["rankstab_global"] * df_resume_global["feature_importance"]
-    )
-    df_resume_global["value_stab_weight"] = (
-        df_resume_global["value_stab"] * df_resume_global["feature_importance"]
-    )
-
-    # ---------------------------------------------------------------------
-    # 5) LOCAL stability: SMLE rank stability per (index, feature)
-    # ---------------------------------------------------------------------
-    # Your compute_rankstab_local_from_shap returns:
-    #   - rankstab_records: list[dict] with columns: feature, index, rankstab_local
-    #   - extra: something else you want to keep
-    rankstab_records, extra = compute_rankstab_local_from_shap(df_abs)
-
-    df_ranking_local = pd.DataFrame(rankstab_records)
-    extra = pd.DataFrame(extra)
-
-    # Your downstream expects int feature ids (kept)
-    if not df_ranking_local.empty and "feature" in df_ranking_local.columns:
-        df_ranking_local["feature"] = df_ranking_local["feature"].astype("int64")
-    if not extra.empty and "feature" in extra.columns:
-        extra["feature"] = extra["feature"].astype("int64")
-
-    # Merge local rank stability with global feature importance
-    df_resume_local = df_ranking_local.merge(df_resume_global, on="feature", how="left")
-
-    # Keep only what you used later
-    df_resume_local = df_resume_local[["feature", "index", "feature_importance", "rankstab_local"]].copy()
-
-    # Local weighted stability
-    df_resume_local["rankstab_local_weight"] = (
-        df_resume_local["rankstab_local"] * df_resume_local["feature_importance"]
-    )
-
-    # Aggregate local stability per "index" (your logic)
-    df_resume_local_agg = df_resume_local.groupby(["index"], as_index=True).sum(numeric_only=True)
-
-    # In your original code you drop these after sum
-    for col in ["feature", "feature_importance"]:
-        if col in df_resume_local_agg.columns:
-            df_resume_local_agg = df_resume_local_agg.drop(columns=[col])
-
-    # Rename aggregated index to "feature" so it can merge with df_resume_global
-    df_resume_local_agg = df_resume_local_agg.reset_index().rename(columns={"index": "feature"})
-
-    # ---------------------------------------------------------------------
-    # 6) Final resume = global resume + aggregated local stability
-    # ---------------------------------------------------------------------
-    df_resume = df_resume_global.merge(df_resume_local_agg, on="feature", how="left")
-
-    return (
-        df_shap,
-        df_ranking_local,
-        extra,
-        df_ranking_global,
-        df_resume_local,
-        df_resume_global,
-        df_resume,
-    )
+    return df_shap
 
 
 def compute_rankstab_local_from_shap(
