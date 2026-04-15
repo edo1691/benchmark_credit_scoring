@@ -238,7 +238,16 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
     # ---------------------------------------------------------------------
     # 4) LOCAL stability
     # ---------------------------------------------------------------------
-    rankstab_records, extra = compute_rankstab_local_from_shap(df_abs)
+    meta_cols = ["n_iteration", "index"]
+
+    selected_features = df_resume_global["feature"].astype(str).tolist()
+
+    cols_to_keep = meta_cols + [
+        col for col in selected_features if col in df_abs.columns
+    ]
+
+    df_abs_filtered = df_abs[cols_to_keep]
+    rankstab_records, extra = compute_rankstab_local_from_shap(df_abs_filtered)
 
     df_ranking_local = pd.DataFrame(rankstab_records)
     extra = pd.DataFrame(extra)
@@ -251,12 +260,18 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
         if "rankstab_local" not in df_ranking_local.columns:
             raise ValueError("df_ranking_local does not contain a 'rankstab_local' column.")
 
-        df_ranking_local["feature"] = df_ranking_local["feature"].astype(str)
+        df_ranking_local["feature"] = pd.to_numeric(
+            df_ranking_local["feature"], errors="coerce"
+        ).astype("Int64")
 
     if not extra.empty and "feature" in extra.columns:
-        extra["feature"] = extra["feature"].astype(str)
+        extra["feature"] = pd.to_numeric(
+            extra["feature"], errors="coerce"
+        ).astype("Int64")
 
-    df_resume_global["feature"] = df_resume_global["feature"].astype(str)
+    df_resume_global["feature"] = pd.to_numeric(
+        df_resume_global["feature"], errors="coerce"
+    ).astype("Int64")
 
     df_resume_local = df_ranking_local.merge(
         df_resume_global,
@@ -395,18 +410,47 @@ def get_train_iterations_shap(
     return df_shap
 
 
+import pandas as pd
+
+
 def compute_rankstab_local_from_shap(
     df_abs: pd.DataFrame,
     index_col: str = "index",
     iter_col: str = "n_iteration",
     exclude_columns: list = None,
-) -> pd.DataFrame:
+    output_col: str = "rankstab_local",
+    higher_is_better: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Input: df_abs with columns [index, n_iteration, <feature1>, <feature2>, ...]
-           Each row = one observation (index) in one iteration, with SHAP abs values.
+    Compute local rank stability from SHAP absolute values.
 
-    Output: DataFrame with columns [feature, index, rankstab_local]
-            rankstab_local = sample variance of feature rank across iterations.
+    Parameters
+    ----------
+    df_abs : pd.DataFrame
+        Input dataframe with columns:
+        [index_col, iter_col, <feature1>, <feature2>, ...]
+        Each row corresponds to one observation in one iteration.
+    index_col : str
+        Observation identifier column.
+    iter_col : str
+        Iteration identifier column.
+    exclude_columns : list | None
+        Columns to exclude from feature ranking. If None, uses [index_col, iter_col].
+    output_col : str
+        Name of the output stability column.
+    higher_is_better : bool
+        If True, convert rank variance to a stability score:
+            stability = 1 / (1 + variance)
+        so that higher values indicate greater stability.
+        If False, returns the raw rank variance, where lower values indicate greater stability.
+
+    Returns
+    -------
+    out : pd.DataFrame
+        DataFrame with columns [feature, index_col, output_col]
+    long : pd.DataFrame
+        Long-format dataframe with one row per (index, iteration, feature),
+        including the computed rank.
     """
     if exclude_columns is None:
         exclude_columns = [index_col, iter_col]
@@ -416,7 +460,10 @@ def compute_rankstab_local_from_shap(
     # Feature columns = everything except id/iteration columns
     feature_cols = [c for c in df.columns if c not in exclude_columns]
 
-    # Ensure numeric (handles commas etc.)
+    if not feature_cols:
+        raise ValueError("No feature columns found after excluding index/iteration columns.")
+
+    # Ensure numeric
     for c in feature_cols:
         df[c] = (
             df[c]
@@ -436,14 +483,22 @@ def compute_rankstab_local_from_shap(
         value_name="rank",
     )
 
-    # Rank stability = sample variance of ranks across iterations for each (index, feature)
+    # Variance of ranks across iterations for each (index, feature)
     out = (
         long.groupby([index_col, "feature"], as_index=False)["rank"]
-        .var(ddof=1)  # matches (1/(K-1))*sum(...)
-        .rename(columns={"rank": "rankstab_local"})
+        .var(ddof=1)
+        .rename(columns={"rank": "_rank_variance"})
     )
 
+    if higher_is_better:
+        # Convert variance into stability score in (0, 1], where 1 = perfectly stable
+        out[output_col] = 1 / (1 + out["_rank_variance"])
+        out = out.drop(columns="_rank_variance")
+    else:
+        out = out.rename(columns={"_rank_variance": output_col})
+
     return out, long
+
 
 
 def compute_df_values_global(
