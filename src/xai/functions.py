@@ -322,15 +322,22 @@ def get_train_iterations_shap(
     y_train: pd.Series,
     n_iterations: int = 5,
     percentage: float = 90,
+    min_positive_per_iteration: int = 2,
 ):
     """
     Train the same model multiple times on different random subsamples
     of the TRAIN set and compute SHAP values on the TEST set.
 
-    Returns
-    -------
-    df_shap : pd.DataFrame
-        Stacked SHAP values across all iterations.
+    Sampling strategy
+    -----------------
+    - Guarantees at least `min_positive_per_iteration` positives in each iteration.
+    - Tries to preserve the original class proportion when possible.
+    - Allows positives to be repeated if needed.
+    - Tries to vary negatives without replacement as much as possible.
+
+    Assumptions
+    -----------
+    - Binary target with labels {0, 1}.
     """
 
     # ---------------------------------------------------------------------
@@ -351,31 +358,111 @@ def get_train_iterations_shap(
         x_test_pre = x_test_pre.copy()
         x_test_pre.index = x_test.index
 
-    feature_names = x_train_pre.columns.tolist() if hasattr(x_train_pre, "columns") else None
+    # Align y_train to the preprocessed train index
+    y_train = y_train.loc[x_train_pre.index].copy()
+
+    feature_names = (
+        x_train_pre.columns.tolist()
+        if hasattr(x_train_pre, "columns")
+        else None
+    )
 
     # ---------------------------------------------------------------------
-    # 2) SHAP across iterations
+    # 2) Basic checks
     # ---------------------------------------------------------------------
+    unique_classes = set(pd.Series(y_train).dropna().unique())
+    if not unique_classes.issubset({0, 1}):
+        raise ValueError(
+            f"Expected binary target with labels {{0, 1}}, got {sorted(unique_classes)}"
+        )
+
+    pos_idx = y_train[y_train == 1].index.to_numpy()
+    neg_idx = y_train[y_train == 0].index.to_numpy()
+
+    n_pos_total = len(pos_idx)
+    n_neg_total = len(neg_idx)
+
+    if n_pos_total == 0:
+        raise ValueError("y_train contains no positive class (1).")
+    if n_neg_total == 0:
+        raise ValueError("y_train contains no negative class (0).")
+
     sample_size = int(len(x_train_pre) * (percentage / 100))
     expected_test_rows = len(x_test_pre)
 
+    if sample_size < 2:
+        raise ValueError(
+            f"sample_size={sample_size} is too small. Increase `percentage`."
+        )
+
+    if min_positive_per_iteration < 1:
+        raise ValueError("`min_positive_per_iteration` must be >= 1.")
+
+    if min_positive_per_iteration >= sample_size:
+        raise ValueError(
+            "`min_positive_per_iteration` must be smaller than the total sample size."
+        )
+
+    positive_rate = n_pos_total / len(y_train)
+
+    # ---------------------------------------------------------------------
+    # 3) Helper: sample one iteration with guaranteed positives
+    # ---------------------------------------------------------------------
+    def _sample_iteration_indices(random_state: int) -> np.ndarray:
+        rng = np.random.RandomState(random_state)
+
+        # Target number of positives based on original prevalence,
+        # but never below the requested minimum.
+        n_pos_target = max(
+            min_positive_per_iteration,
+            int(round(sample_size * positive_rate))
+        )
+
+        # Keep at least one slot for negatives.
+        n_pos_target = min(n_pos_target, sample_size - 1)
+        n_neg_target = sample_size - n_pos_target
+
+        # Positives:
+        # - without replacement if enough are available
+        # - with replacement if more are needed than available
+        if n_pos_target <= n_pos_total:
+            sampled_pos = rng.choice(pos_idx, size=n_pos_target, replace=False)
+        else:
+            sampled_pos_unique = pos_idx.copy()
+            extra_needed = n_pos_target - n_pos_total
+            sampled_pos_extra = rng.choice(pos_idx, size=extra_needed, replace=True)
+            sampled_pos = np.concatenate([sampled_pos_unique, sampled_pos_extra])
+
+        # Negatives:
+        # - prefer without replacement so zeros change as much as possible
+        # - fallback to replacement only if absolutely necessary
+        if n_neg_target <= n_neg_total:
+            sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=False)
+        else:
+            sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=True)
+
+        sampled_idx = np.concatenate([sampled_pos, sampled_neg])
+        rng.shuffle(sampled_idx)
+
+        return sampled_idx
+
+    # ---------------------------------------------------------------------
+    # 4) SHAP across iterations
+    # ---------------------------------------------------------------------
     shap_frames = []
-    seen_samples = []
 
     for iteration in range(n_iterations):
+        sampled_idx = _sample_iteration_indices(random_state=iteration)
 
-        while True:
-            sampled_x = x_train_pre.sample(
-                n=sample_size,
-                random_state=iteration,
-                replace=False
+        sampled_x = x_train_pre.loc[sampled_idx]
+        sampled_y = y_train.loc[sampled_idx]
+
+        # Safety check: never fit on a single-class sample
+        if sampled_y.nunique() < 2:
+            raise RuntimeError(
+                f"Iteration {iteration} produced a single-class sample. "
+                "This should not happen with the custom sampler."
             )
-
-            if not any(sampled_x.equals(prev) for prev in seen_samples):
-                seen_samples.append(sampled_x)
-                break
-
-        sampled_y = y_train.loc[sampled_x.index]
 
         model_clone = clone(pipeline.named_steps["model"])
         model_clone.fit(sampled_x, sampled_y)
@@ -402,6 +489,8 @@ def get_train_iterations_shap(
 
         shap_df["n_iteration"] = iteration
         shap_df["index"] = shap_df.index
+        shap_df["n_pos_sampled"] = int((sampled_y == 1).sum())
+        shap_df["n_neg_sampled"] = int((sampled_y == 0).sum())
 
         shap_frames.append(shap_df)
 
