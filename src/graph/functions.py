@@ -1,11 +1,13 @@
-
-
 from __future__ import annotations
 
 import math
 import numpy as np
 import pandas as pd
+
 import matplotlib.pyplot as plt
+from pathlib import Path
+import math
+import seaborn as sns
 
 
 def plot_imbalance_boxplot_grid(
@@ -292,3 +294,218 @@ def plot_model_boxplot(
     plt.tight_layout()
 
     return fig, ax
+
+
+def load_xai_file(
+    data_dir,
+    dataset_name,
+    dataset_variant=None,
+    model_choice=None,
+    file_type="summary",
+    normalized=False,
+):
+    """
+    Load saved XAI result files.
+
+    Supports:
+    --------
+    1) Standard model-level files
+       Example:
+       german_5_XGBoost_summary.csv
+       german_5_XGBoost_resume_local.csv
+       german_5_XGBoost_resume_global.csv
+
+    2) Merged all-models files created by merge_xai_results()
+       Example:
+       german_xai_all_models_summary.csv
+       german_xai_all_models_summary_normalized.csv
+       german_xai_all_models_resume_local.csv
+       german_xai_all_models_resume_global.csv
+
+    Parameters
+    ----------
+    data_dir : str | Path
+        Base project directory.
+
+    dataset_name : str
+        Dataset name, e.g. "german"
+
+    dataset_variant : str | None
+        Variant name, e.g. "german_5"
+        Required only for model-level files.
+
+    model_choice : str | None
+        Model name, e.g. "XGBoost"
+        Required only for model-level files.
+
+    file_type : str
+        Accepted values:
+
+        Model-level files:
+            "summary"
+            "resume_local"
+            "resume_global"
+
+        Merged files:
+            "all_models_summary"
+            "all_models_resume_local"
+            "all_models_resume_global"
+
+    normalized : bool, default=False
+        Used only for merged files.
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+
+    data_dir = Path(data_dir)
+
+    # ===================================================
+    # MERGED FILES
+    # ===================================================
+    merged_prefix = "all_models_"
+
+    if file_type.startswith(merged_prefix):
+
+        base_type = file_type.replace(merged_prefix, "")
+        suffix = "_normalized" if normalized else ""
+
+        file_path = (
+            data_dir
+            / "output"
+            / dataset_name
+            / "xai"
+            / f"{dataset_name}_xai_all_models_{base_type}{suffix}.csv"
+        )
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        return pd.read_csv(file_path)
+
+    # ===================================================
+    # STANDARD MODEL FILES
+    # ===================================================
+    if dataset_variant is None or model_choice is None:
+        raise ValueError(
+            "dataset_variant and model_choice are required "
+            "for model-level files."
+        )
+
+    result_dir = (
+        data_dir
+        / "output"
+        / dataset_name
+        / "xai"
+        / model_choice
+        / dataset_variant
+        / "metrics"
+    )
+
+    file_path = result_dir / f"{dataset_variant}_{model_choice}_{file_type}.csv"
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    return pd.read_csv(file_path)
+
+
+def plot_models_by_imbalance(
+    df,
+    dataset,
+    models,
+    imbalance_levels,
+    metric="rankstab_local",
+    ylabel="Local stability",
+    xlabel="Model",
+    ncols=2,
+    suptitle=None,
+):
+    df_plot = df[
+        (df["dataset"] == dataset) &
+        (df["model"].isin(models)) &
+        (df["imbalance"].isin(imbalance_levels))
+    ].copy()
+
+    n_plots = len(imbalance_levels)
+    nrows = math.ceil(n_plots / ncols)
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(6 * ncols, 5.0 * nrows),
+        squeeze=False,
+    )
+
+    axes = axes.flatten()
+
+    palette = sns.color_palette("Greys", n_colors=len(models) + 2)[2:]
+
+    for i, imbalance in enumerate(imbalance_levels):
+        ax = axes[i]
+
+        df_temp = df_plot[df_plot["imbalance"] == imbalance].copy()
+
+        sns.boxplot(
+            data=df_temp,
+            x="model",
+            y=metric,
+            order=models,
+            palette=palette,
+            linewidth=1.0,
+            fliersize=2,
+            ax=ax,
+        )
+
+        ax.set_title(f"Default rate = {imbalance}", fontsize=9)
+        ax.set_xlabel("")
+        ax.set_ylabel(ylabel, fontsize=9)
+
+        ax.tick_params(axis="x", labelrotation=0, labelsize=7, pad=20)
+        ax.tick_params(axis="y", labelsize=8)
+
+        trans = ax.get_xaxis_transform()
+
+        for x_pos, model in enumerate(models):
+            values = df_temp.loc[df_temp["model"] == model, metric].dropna()
+
+            if len(values) > 0:
+                q1 = values.quantile(0.25)
+                q3 = values.quantile(0.75)
+                iqr = q3 - q1
+                median = values.median()
+
+                ax.text(
+                    x_pos,
+                    -0.16,
+                    f"Med={median:.3f}",
+                    transform=trans,
+                    ha="center",
+                    va="top",
+                    fontsize=6,
+                )
+
+                ax.text(
+                    x_pos,
+                    -0.22,
+                    f"IQR={iqr:.3f}",
+                    transform=trans,
+                    ha="center",
+                    va="top",
+                    fontsize=6,
+                )
+
+        ax.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+        sns.despine(ax=ax)
+
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontsize=10)
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.16, hspace=0.50)
+
+    return fig, axes

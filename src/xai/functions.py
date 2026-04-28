@@ -161,9 +161,12 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
     # ---------------------------------------------------------------------
     # 2) Prepare absolute SHAP values
     # ---------------------------------------------------------------------
+    print("Preparing absolute SHAP values...")
     df_abs = df_shap.copy()
 
-    meta_cols = {"n_iteration", "index", "base_value"}
+    id_cols = {"n_iteration"}
+    meta_cols = {"base_value", "n_pos_sampled", "n_neg_sampled"}
+    meta_cols_id = {"index", "base_value", "n_pos_sampled", "n_neg_sampled"}
     feature_cols = [col for col in df_abs.columns if col not in meta_cols]
 
     if not feature_cols:
@@ -171,76 +174,118 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
 
     df_abs[feature_cols] = df_abs[feature_cols].abs()
 
-    if "base_value" in df_abs.columns:
-        df_abs = df_abs.drop(columns=["base_value"])
+    df_feature_importance = df_abs.copy()
 
     # ---------------------------------------------------------------------
-    # 3) GLOBAL stability
+    # 3) Feature importance by iteration
     # ---------------------------------------------------------------------
-    df_values_global = compute_df_values_global(df_abs)
-    value_stab_global = compute_value_stab(df_values_global)
-
-    df_resume_cv_global = value_stab_global.copy()
-
-    metric_cols = [
-        col for col in df_resume_cv_global.columns
-        if col not in ["feature", "value_stab"]
-    ]
-
-    if not metric_cols:
-        raise ValueError(
-            "compute_value_stab(df_values_global) did not return iteration/value columns."
+    print("Computing feature importance by iteration...")
+    ft_selected = [col for col in df_feature_importance.columns if col not in meta_cols_id]
+    df_feature_importance = (
+        df_feature_importance[ft_selected]
+        .groupby("n_iteration", as_index=False)[ft_selected]
+        .mean()
+        .melt(
+            id_vars="n_iteration",
+            var_name="feature",
+            value_name="feature_importance",
         )
-
-    df_resume_cv_global["feature_importance"] = (
-        df_resume_cv_global[metric_cols].mean(axis=1)
     )
 
-    df_filtered = df_resume_cv_global[
-        df_resume_cv_global["feature_importance"] > 0
+    df_feature_importance = df_feature_importance[
+        ["feature", "n_iteration", "feature_importance"]
+    ]
+    print("Feature table before global importance merged:")
+    print(df_feature_importance.head())
+    # ---------------------------------------------------------------------
+    # 3.1) Global feature importance
+    # ---------------------------------------------------------------------
+    print("Computing global feature importance...")
+    df_feature_importance_agg = (
+        df_feature_importance
+        .groupby("feature", as_index=False)["feature_importance"]
+        .mean()
+    )
+
+    total_importance = df_feature_importance_agg["feature_importance"].sum()
+
+    df_feature_importance_agg["feature_importance_global"] = (
+        df_feature_importance_agg["feature_importance"] / total_importance
+    )
+
+    df_feature_importance_agg = df_feature_importance_agg[
+        ["feature", "feature_importance_global"]
+    ]
+    # ---------------------------------------------------------------------
+    # 3.2) Add global importance to per-iteration resume
+    # ---------------------------------------------------------------------
+    print("Merging global feature importance into per-iteration data...")
+    df_feature_importance = df_feature_importance.merge(
+        df_feature_importance_agg,
+        on="feature",
+        how="left"
+    )
+    df_feature_importance = df_feature_importance[
+        ["feature", "n_iteration", "feature_importance", "feature_importance_global"]
+    ]
+    print("Feature table with global importance merged:")
+    print(df_feature_importance.head())
+    # ---------------------------------------------------------------------
+    # 4) GLOBAL stability
+    # ---------------------------------------------------------------------
+    print("Computing global stability metrics...")
+    ft_selected = [col for col in df_abs.columns if col not in meta_cols]
+    df_values_global = compute_df_values_global(df_abs[ft_selected])
+
+    # From df_feature_importance, Take only the features with the featurre_importance_global > 0 and keep just that rows in df_values_global
+    df_values_global = df_values_global[
+        df_values_global["feature"].isin(
+            df_feature_importance_agg[df_feature_importance_agg["feature_importance_global"] > 0]["feature"]
+        )
+    ]
+    # if df_values_global is empty after filtering, raise an error and continue to the next steps without computing global stability metrcis, and also skip local stability computation since it depends on global stability results
+    if df_values_global.empty:
+        print("No features with global importance > 0. Skipping global stability metrics and local stability computation.")
+        df_resume_global = pd.DataFrame(columns=["feature", "rankstab_global", "value_stab", "feature_importance_global"])
+        df_resume_local = pd.DataFrame(columns=["feature", "index", "rankstab_local"])
+        return df_resume_local, pd.DataFrame(columns=["index", "rankstab_local"]), df_resume_global
+
+    ft_selected = [col for col in df_values_global.columns if col not in meta_cols_id]
+    value_stab_global = compute_value_stab(df_values_global[ft_selected])
+    print(value_stab_global)
+    df_resume_cv_global = value_stab_global[
+        ["feature", "value_stab"]
     ].copy()
 
-    df_resume_cv_global = df_resume_cv_global[
-        ["feature", "feature_importance", "value_stab"]
-    ].copy()
-
-    df_ranking_global = compute_df_ranking_global(df_filtered)
+    df_ranking_global = compute_df_ranking_global(df_values_global)
+    print(df_ranking_global)
     df_resume_stab_global = df_ranking_global[
         ["feature", "rankstab_global"]
     ].copy()
 
     # Make dtype consistent
     df_resume_cv_global["feature"] = df_resume_cv_global["feature"].astype(str)
-    df_ranking_global["feature"] = df_ranking_global["feature"].astype(str)
     df_resume_stab_global["feature"] = df_resume_stab_global["feature"].astype(str)
 
-    df_resume_global = df_resume_stab_global.merge(
+    df_resume_global_temp = df_resume_stab_global.merge(
         df_resume_cv_global,
         on="feature",
         how="left"
     )
 
-    total_importance = df_resume_global["feature_importance"].sum()
-    if total_importance != 0:
-        df_resume_global["feature_importance"] = (
-            df_resume_global["feature_importance"] / total_importance * 100
-        )
-    else:
-        df_resume_global["feature_importance"] = 0.0
-
-    df_resume_global["rankstab_global_weight"] = (
-        df_resume_global["rankstab_global"] * df_resume_global["feature_importance"]
+    df_resume_global = df_resume_global_temp.merge(
+        df_feature_importance_agg,
+        on="feature",
+        how="left"
     )
-    df_resume_global["value_stab_weight"] = (
-        df_resume_global["value_stab"] * df_resume_global["feature_importance"]
-    )
-
     # ---------------------------------------------------------------------
-    # 4) LOCAL stability
+    # 5) LOCAL stability
     # ---------------------------------------------------------------------
+    print("Computing local stability metrics...")
+    
     meta_cols = ["n_iteration", "index"]
 
-    selected_features = df_resume_global["feature"].astype(str).tolist()
+    selected_features = df_resume_global_temp["feature"].astype(str).tolist()
 
     cols_to_keep = meta_cols + [
         col for col in selected_features if col in df_abs.columns
@@ -273,46 +318,95 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
         df_resume_global["feature"], errors="coerce"
     ).astype("Int64")
 
-    df_resume_local = df_ranking_local.merge(
+    df_resume_local_temp = df_ranking_local.merge(
         df_resume_global,
         on="feature",
         how="left"
     )
 
-    df_resume_local = df_resume_local[
-        ["feature", "index", "feature_importance", "rankstab_local"]
+    df_resume_local_temp = df_resume_local_temp[
+        ["feature", "index", "rankstab_local"]
     ].copy()
 
-    df_resume_local["rankstab_local_weight"] = (
-        df_resume_local["rankstab_local"] * df_resume_local["feature_importance"]
+    df_resume_local_temp["feature"] = df_resume_local_temp["feature"].astype(str)
+    df_feature_importance_agg["feature"] = df_feature_importance_agg["feature"].astype(str)
+
+    df_resume_local = df_resume_local_temp.merge(
+        df_feature_importance_agg,
+        on="feature",
+        how="left"
     )
 
+    df_resume_local["rankstab_local_weight"] = (
+        df_resume_local["rankstab_local"]
+        * df_resume_local["feature_importance_global"]
+    )
     # Aggregate local stability by feature
     df_resume_local_agg = (
-        df_resume_local.groupby("feature", as_index=False)
+        df_resume_local.groupby("index", as_index=False)
         .agg({
             "rankstab_local": "mean",
             "rankstab_local_weight": "mean"
         })
     )
+    # ---------------------------------------------------------------------
+    # 6) Weighted metrics
+    # ---------------------------------------------------------------------
 
-    # ---------------------------------------------------------------------
-    # 5) Final summary
-    # ---------------------------------------------------------------------
-    df_resume = df_resume_global.merge(
-        df_resume_local_agg,
-        on="feature",
-        how="left"
+    # Global dataset
+    df_resume_global = df_resume_global.copy()
+
+    df_resume_global["value_stab_weight"] = (
+        df_resume_global["value_stab"]
+        * df_resume_global["feature_importance_global"]
+        * 100
     )
 
+    df_resume_global["rankstab_global_weight"] = (
+        df_resume_global["rankstab_global"]
+        * df_resume_global["feature_importance_global"]
+        * 100
+    )
+
+    # ---------------------------------------------------------------------
+    # 7) Final summary
+    # ---------------------------------------------------------------------
     return (
-        df_ranking_local,
-        extra,
-        df_ranking_global,
         df_resume_local,
+        df_resume_local_agg,
         df_resume_global,
-        df_resume,
     )
+
+
+def compute_feature_importance_by_iteration(df_shap: pd.DataFrame) -> pd.DataFrame:
+    meta_cols = {
+        "base_value",
+        "n_iteration",
+        "index",
+        "n_pos_sampled",
+        "n_neg_sampled",
+    }
+
+    feature_cols = [col for col in df_shap.columns if col not in meta_cols]
+
+    if not feature_cols:
+        raise ValueError("No feature columns found in df_shap.")
+
+    df_feature_importance = (
+        df_shap
+        .assign(**{col: df_shap[col].abs() for col in feature_cols})
+        .groupby("n_iteration", as_index=False)[feature_cols]
+        .mean()
+        .melt(
+            id_vars="n_iteration",
+            value_vars=feature_cols,
+            var_name="feature",
+            value_name="feature_importance",
+        )
+        [["feature", "n_iteration", "feature_importance"]]
+    )
+
+    return df_feature_importance
 
 
 def get_train_iterations_shap(
