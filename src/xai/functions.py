@@ -9,6 +9,7 @@ import lightgbm as lgb
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.svm import SVC
 from sklearn.base import clone
+from sklearn.metrics import average_precision_score
 
 
 def wrap_booster_if_needed(model):
@@ -443,7 +444,9 @@ def compute_feature_importance_by_iteration(df_shap: pd.DataFrame) -> pd.DataFra
 
 
 from sklearn.base import clone
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
+import numpy as np
+import pandas as pd
 
 
 def get_train_iterations_shap(
@@ -451,11 +454,11 @@ def get_train_iterations_shap(
     x_train: pd.DataFrame,
     x_test: pd.DataFrame,
     y_train: pd.Series,
-    y_test: pd.Series | None = None,
+    y_test: pd.Series = None,
     n_iterations: int = 5,
     percentage: float = 90,
     min_positive_per_iteration: int = 2,
-    metrics: dict | None = None,
+    metrics: dict = None,
 ):
     """
     Train the same model multiple times on different random subsamples
@@ -470,9 +473,22 @@ def get_train_iterations_shap(
         Performance metrics for each trained model in each iteration.
     """
 
+    # ---------------------------------------------------------------------
+    # Custom metric functions
+    # ---------------------------------------------------------------------
+    def partial_gini(y_true, y_score):
+        auc = roc_auc_score(y_true, y_score)
+        return 2 * auc - 1
+
+    def ks_statistic(y_true, y_score):
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        return np.max(tpr - fpr)
+
     if metrics is None:
         metrics = {
             "pr_auc": average_precision_score,
+            "pg": partial_gini,
+            "ks": ks_statistic,
         }
 
     # ---------------------------------------------------------------------
@@ -588,8 +604,7 @@ def get_train_iterations_shap(
 
         if sampled_y.nunique() < 2:
             raise RuntimeError(
-                f"Iteration {iteration} produced a single-class sample. "
-                "This should not happen with the custom sampler."
+                f"Iteration {iteration} produced a single-class sample."
             )
 
         model_clone = clone(pipeline.named_steps["model"])
@@ -611,8 +626,7 @@ def get_train_iterations_shap(
                 y_score = model_clone.decision_function(x_test_pre)
             else:
                 raise ValueError(
-                    "Model must support predict_proba or decision_function "
-                    "to compute PR-AUC."
+                    "Model must support predict_proba or decision_function."
                 )
 
             for metric_name, metric_func in metrics.items():
@@ -637,11 +651,6 @@ def get_train_iterations_shap(
         if len(shap_df) == expected_test_rows:
             shap_df = shap_df.copy()
             shap_df.index = x_test_pre.index
-        else:
-            print(
-                f"[WARN] iter={iteration}: get_prediction_xai returned {len(shap_df)} rows "
-                f"(expected {expected_test_rows})."
-            )
 
         shap_df["n_iteration"] = iteration
         shap_df["index"] = shap_df.index
