@@ -442,30 +442,38 @@ def compute_feature_importance_by_iteration(df_shap: pd.DataFrame) -> pd.DataFra
     return df_feature_importance
 
 
+from sklearn.base import clone
+from sklearn.metrics import average_precision_score
+
+
 def get_train_iterations_shap(
     pipeline,
     x_train: pd.DataFrame,
     x_test: pd.DataFrame,
     y_train: pd.Series,
+    y_test: pd.Series | None = None,
     n_iterations: int = 5,
     percentage: float = 90,
     min_positive_per_iteration: int = 2,
+    metrics: dict | None = None,
 ):
     """
     Train the same model multiple times on different random subsamples
     of the TRAIN set and compute SHAP values on the TEST set.
 
-    Sampling strategy
-    -----------------
-    - Guarantees at least `min_positive_per_iteration` positives in each iteration.
-    - Tries to preserve the original class proportion when possible.
-    - Allows positives to be repeated if needed.
-    - Tries to vary negatives without replacement as much as possible.
+    Returns
+    -------
+    df_shap : pd.DataFrame
+        SHAP values across retraining iterations.
 
-    Assumptions
-    -----------
-    - Binary target with labels {0, 1}.
+    df_performance : pd.DataFrame
+        Performance metrics for each trained model in each iteration.
     """
+
+    if metrics is None:
+        metrics = {
+            "pr_auc": average_precision_score,
+        }
 
     # ---------------------------------------------------------------------
     # 1) Preprocess train/test while preserving original indices
@@ -485,8 +493,10 @@ def get_train_iterations_shap(
         x_test_pre = x_test_pre.copy()
         x_test_pre.index = x_test.index
 
-    # Align y_train to the preprocessed train index
     y_train = y_train.loc[x_train_pre.index].copy()
+
+    if y_test is not None:
+        y_test = y_test.loc[x_test_pre.index].copy()
 
     feature_names = (
         x_train_pre.columns.tolist()
@@ -538,20 +548,14 @@ def get_train_iterations_shap(
     def _sample_iteration_indices(random_state: int) -> np.ndarray:
         rng = np.random.RandomState(random_state)
 
-        # Target number of positives based on original prevalence,
-        # but never below the requested minimum.
         n_pos_target = max(
             min_positive_per_iteration,
             int(round(sample_size * positive_rate))
         )
 
-        # Keep at least one slot for negatives.
         n_pos_target = min(n_pos_target, sample_size - 1)
         n_neg_target = sample_size - n_pos_target
 
-        # Positives:
-        # - without replacement if enough are available
-        # - with replacement if more are needed than available
         if n_pos_target <= n_pos_total:
             sampled_pos = rng.choice(pos_idx, size=n_pos_target, replace=False)
         else:
@@ -560,9 +564,6 @@ def get_train_iterations_shap(
             sampled_pos_extra = rng.choice(pos_idx, size=extra_needed, replace=True)
             sampled_pos = np.concatenate([sampled_pos_unique, sampled_pos_extra])
 
-        # Negatives:
-        # - prefer without replacement so zeros change as much as possible
-        # - fallback to replacement only if absolutely necessary
         if n_neg_target <= n_neg_total:
             sampled_neg = rng.choice(neg_idx, size=n_neg_target, replace=False)
         else:
@@ -574,9 +575,10 @@ def get_train_iterations_shap(
         return sampled_idx
 
     # ---------------------------------------------------------------------
-    # 4) SHAP across iterations
+    # 4) SHAP and performance across iterations
     # ---------------------------------------------------------------------
     shap_frames = []
+    performance_frames = []
 
     for iteration in range(n_iterations):
         sampled_idx = _sample_iteration_indices(random_state=iteration)
@@ -584,7 +586,6 @@ def get_train_iterations_shap(
         sampled_x = x_train_pre.loc[sampled_idx]
         sampled_y = y_train.loc[sampled_idx]
 
-        # Safety check: never fit on a single-class sample
         if sampled_y.nunique() < 2:
             raise RuntimeError(
                 f"Iteration {iteration} produced a single-class sample. "
@@ -594,6 +595,34 @@ def get_train_iterations_shap(
         model_clone = clone(pipeline.named_steps["model"])
         model_clone.fit(sampled_x, sampled_y)
 
+        # -------------------------------------------------------------
+        # Performance block
+        # -------------------------------------------------------------
+        perf_row = {
+            "n_iteration": iteration,
+            "n_pos_sampled": int((sampled_y == 1).sum()),
+            "n_neg_sampled": int((sampled_y == 0).sum()),
+        }
+
+        if y_test is not None:
+            if hasattr(model_clone, "predict_proba"):
+                y_score = model_clone.predict_proba(x_test_pre)[:, 1]
+            elif hasattr(model_clone, "decision_function"):
+                y_score = model_clone.decision_function(x_test_pre)
+            else:
+                raise ValueError(
+                    "Model must support predict_proba or decision_function "
+                    "to compute PR-AUC."
+                )
+
+            for metric_name, metric_func in metrics.items():
+                perf_row[metric_name] = metric_func(y_test, y_score)
+
+        performance_frames.append(perf_row)
+
+        # -------------------------------------------------------------
+        # SHAP block
+        # -------------------------------------------------------------
         shap_transformer = SHAPTransformer(model_clone)
         shap_transformer.fit(sampled_x)
 
@@ -622,11 +651,9 @@ def get_train_iterations_shap(
         shap_frames.append(shap_df)
 
     df_shap = pd.concat(shap_frames, ignore_index=True)
+    df_performance = pd.DataFrame(performance_frames)
 
-    return df_shap
-
-
-import pandas as pd
+    return df_shap, df_performance
 
 
 def compute_rankstab_local_from_shap(

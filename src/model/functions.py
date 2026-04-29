@@ -405,8 +405,8 @@ def get_train_model(
     # -------------------------------
     _validate_search_space(search_space)
 
-    n_iter = 1 if test_mode else 50
-    n_splits = 2 if test_mode else 5
+    n_iter = 10 if test_mode else 30
+    n_splits = 3 if test_mode else 5
     cv_strategy = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     if BayesSearchCV is None:

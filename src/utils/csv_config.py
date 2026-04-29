@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 import pandas as pd
+from fractions import Fraction
 
 
 DEFAULT_CSV_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -155,11 +156,17 @@ def create_imbalanced_datasets(
     random_state: int = 123,
 ):
     """
-    Create derived datasets with a desired positive rate (pct/100).
+    Create derived datasets with target positive rates.
 
-    Preference:
-      1) Keep as many positives as possible -> downsample negatives first.
-      2) If not achievable, keep all negatives -> downsample positives.
+    For each target rate, the function maximizes the number of usable
+    observations while preserving the requested imbalance ratio.
+
+    Example:
+        1% positive rate means:
+            1 positive / 99 negatives
+            2 positives / 198 negatives
+            ...
+        The function chooses the largest feasible multiple.
     """
 
     if imbalance_levels is None:
@@ -174,7 +181,6 @@ def create_imbalanced_datasets(
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found in dataset")
 
-    # Clean + ensure binary {0,1}
     df = df.copy()
     df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
     df = df[df[target_col].isin([0, 1])].copy()
@@ -186,75 +192,87 @@ def create_imbalanced_datasets(
     n_pos = len(df_pos)
     n_neg = len(df_neg)
     n_total = len(df)
-    original_rate = float(df[target_col].mean()) if n_total else 0.0
 
     print("==========================================")
     print(f"Original dataset: {dataset_name}")
     print(f"Total samples: {n_total}")
     print(f"Positive samples: {n_pos}")
     print(f"Negative samples: {n_neg}")
-    print(f"Positive rate: {original_rate:.4f}")
+    print(f"Positive rate: {df[target_col].mean():.4f}")
     print("==========================================\n")
 
     save_dir = data_dir / "intermediate" / dataset_name
     save_dir.mkdir(parents=True, exist_ok=True)
 
     for pct in imbalance_levels:
-        r = pct / 100.0
+        r = pct / 100
 
-        # guardrails
         if r <= 0 or r >= 1:
             print(f"[SKIP] {pct}% — invalid target rate.")
             continue
+
         if n_pos == 0 or n_neg == 0:
             print(f"[SKIP] {pct}% — dataset has only one class.")
             continue
 
-        # Use a per-level seed to avoid identical samples across pcts if desired
-        seed = random_state + int(pct)
+        seed = random_state + int(float(pct) * 1000)
 
-        # ---- Option A: keep all positives, downsample negatives
-        n_neg_needed = int(np.floor(n_pos * (1 - r) / r))
+        # Convert percentage into an exact fraction
+        # Example: 1% -> 1/100, 5% -> 1/20
+        rate_fraction = Fraction(str(r)).limit_denominator(10_000)
 
-        if n_neg_needed <= n_neg:
-            df_pos_keep = df_pos
-            df_neg_keep = df_neg.sample(n=n_neg_needed, random_state=seed, replace=False)
+        pos_unit = rate_fraction.numerator
+        total_unit = rate_fraction.denominator
+        neg_unit = total_unit - pos_unit
 
-            strategy = f"keep all positives ({n_pos}), downsample negatives to {n_neg_needed}"
+        # Largest feasible multiplier preserving the exact ratio
+        max_k_pos = n_pos // pos_unit
+        max_k_neg = n_neg // neg_unit
+        k = min(max_k_pos, max_k_neg)
 
-        else:
-            # ---- Option B: keep all negatives, downsample positives
-            n_pos_needed = int(np.floor(r * n_neg / (1 - r)))
+        if k <= 0:
+            print(
+                f"[SKIP] {dataset_name}_{pct}: exact {pct}% rate not achievable "
+                f"with available positives/negatives."
+            )
+            continue
 
-            if n_pos_needed <= 0:
-                print(f"[SKIP] {dataset_name}_{pct}: would require 0 positives.")
-                continue
-            if n_pos_needed > n_pos:
-                # This should be rare, but handle anyway
-                print(f"[SKIP] {dataset_name}_{pct}: not achievable with available data.")
-                continue
+        n_pos_keep = pos_unit * k
+        n_neg_keep = neg_unit * k
 
-            df_neg_keep = df_neg
-            df_pos_keep = df_pos.sample(n=n_pos_needed, random_state=seed, replace=False)
+        df_pos_keep = df_pos.sample(
+            n=n_pos_keep,
+            random_state=seed,
+            replace=False,
+        )
 
-            strategy = f"keep all negatives ({n_neg}), downsample positives to {n_pos_needed}"
+        df_neg_keep = df_neg.sample(
+            n=n_neg_keep,
+            random_state=seed,
+            replace=False,
+        )
 
         df_new = (
-            pd.concat([df_neg_keep, df_pos_keep], axis=0)
-              .sample(frac=1, random_state=seed)
-              .reset_index(drop=True)
+            pd.concat([df_pos_keep, df_neg_keep], axis=0)
+            .sample(frac=1, random_state=seed)
+            .reset_index(drop=True)
         )
 
         n_total_new = len(df_new)
         n_pos_new = int(df_new[target_col].sum())
-        new_rate = float(df_new[target_col].mean())
+        n_neg_new = n_total_new - n_pos_new
+        new_rate = df_new[target_col].mean()
 
         save_path = save_dir / f"{dataset_name}_{pct}.csv"
         df_new.to_csv(save_path, index=False, sep=",")
 
         print(
-            f"{dataset_name}_{pct}.csv | Total={n_total_new} | Pos={n_pos_new} | "
-            f"Rate={new_rate:.4f} | {strategy}"
+            f"{dataset_name}_{pct}.csv | "
+            f"Total={n_total_new} | "
+            f"Pos={n_pos_new} | "
+            f"Neg={n_neg_new} | "
+            f"Rate={new_rate:.4f} | "
+            f"Target={r:.4f}"
         )
 
     print("\nFinished generating imbalanced datasets.")
