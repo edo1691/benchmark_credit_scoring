@@ -282,7 +282,7 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
     # 5) LOCAL stability
     # ---------------------------------------------------------------------
     print("Computing local stability metrics...")
-    
+
     meta_cols = ["n_iteration", "index"]
 
     selected_features = df_resume_global_temp["feature"].astype(str).tolist()
@@ -337,10 +337,43 @@ def compute_xai_metrics_from_shap(df_shap: pd.DataFrame):
         how="left"
     )
 
+    # ---------------------------------------------------------------------
+    # Normalize global feature importance into [0, 1]
+    # so rankstab_local_weight also remains in [0, 1]
+    # ---------------------------------------------------------------------
+    if "feature_importance_global" not in df_resume_local.columns:
+        raise ValueError(
+            "df_resume_local does not contain 'feature_importance_global'. "
+            "Check df_feature_importance_agg before merging."
+        )
+
+    df_resume_local["feature_importance_global"] = pd.to_numeric(
+        df_resume_local["feature_importance_global"],
+        errors="coerce"
+    )
+
+    min_imp = df_resume_local["feature_importance_global"].min()
+    max_imp = df_resume_local["feature_importance_global"].max()
+
+    if pd.isna(min_imp) or pd.isna(max_imp):
+        df_resume_local["feature_importance_global_norm"] = np.nan
+    elif max_imp == min_imp:
+        df_resume_local["feature_importance_global_norm"] = 1.0
+    else:
+        df_resume_local["feature_importance_global_norm"] = (
+            (df_resume_local["feature_importance_global"] - min_imp)
+            / (max_imp - min_imp)
+        )
+
     df_resume_local["rankstab_local_weight"] = (
         df_resume_local["rankstab_local"]
-        * df_resume_local["feature_importance_global"]
+        * df_resume_local["feature_importance_global_norm"]
     )
+
+    df_resume_local["rankstab_local_weight"] = (
+        df_resume_local["rankstab_local_weight"].clip(0, 1)
+    )
+
     # Aggregate local stability by feature
     df_resume_local_agg = (
         df_resume_local.groupby("index", as_index=False)
